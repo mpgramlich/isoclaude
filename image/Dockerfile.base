@@ -1,0 +1,33 @@
+# Base image for isoclaude.
+#
+# Builds debian-slim with node, git, gosu, and a non-root `claude` user.
+# The actual Claude Code CLI is installed at a pinned version supplied via
+# the CLAUDE_VERSION build arg, and recorded in an image label so the
+# wrapper can detect drift and trigger rebuilds.
+
+FROM debian:bookworm-slim
+
+ARG CLAUDE_VERSION
+RUN test -n "$CLAUDE_VERSION" || (echo "CLAUDE_VERSION build-arg is required" >&2; exit 1)
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates curl git gosu gnupg openssh-client \
+ && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_VERSION}"
+
+RUN groupadd -g 1000 claude \
+ && useradd -m -u 1000 -g 1000 -s /bin/bash claude
+
+COPY entrypoint.sh /usr/local/bin/isoclaude-entrypoint
+RUN chmod +x /usr/local/bin/isoclaude-entrypoint
+
+ENV HOME=/home/claude
+LABEL isoclaude.claude_version="${CLAUDE_VERSION}"
+
+ENTRYPOINT ["/usr/local/bin/isoclaude-entrypoint"]
+CMD ["claude"]
