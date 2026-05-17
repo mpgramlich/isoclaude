@@ -11,10 +11,34 @@
 
 set -e
 
-if [ -n "$HOST_UID" ] && [ "$HOST_UID" != "$(id -u claude)" ]; then
-    usermod  -u "$HOST_UID" claude >/dev/null
-    groupmod -g "${HOST_GID:-$HOST_UID}" claude >/dev/null
+remap_gid() {
+    target="$1"
+    [ -n "$target" ] && [ "$target" != "$(id -g claude)" ] || return 0
+    if getent group "$target" >/dev/null 2>&1; then
+        # A group with this GID already exists (common: HOST_GID=20 is
+        # macOS staff but also debian's dialout). Reassign claude to that
+        # group as its primary rather than renaming the existing group.
+        usermod -g "$target" claude
+    else
+        groupmod -g "$target" claude
+    fi
+}
 
+remap_uid() {
+    target="$1"
+    [ -n "$target" ] && [ "$target" != "$(id -u claude)" ] || return 0
+    if getent passwd "$target" >/dev/null 2>&1 && \
+       [ "$(getent passwd "$target" | cut -d: -f1)" != "claude" ]; then
+        echo "isoclaude-entrypoint: HOST_UID=$target collides with existing container user" >&2
+        exit 1
+    fi
+    usermod -u "$target" claude
+}
+
+remap_gid "${HOST_GID:-${HOST_UID:-}}"
+remap_uid "${HOST_UID:-}"
+
+if [ -n "${HOST_UID:-}" ]; then
     chown "$HOST_UID:${HOST_GID:-$HOST_UID}" /home/claude
 
     # Re-own dotfiles/etc. inside the home dir, but skip the bind mounts.

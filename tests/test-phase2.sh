@@ -47,9 +47,9 @@ echo "$@" >> "$FAKE_DOCKER_LOG"
 case "$1" in
     image)
         if [ "$2" = "inspect" ]; then
-            # If FAKE_LABEL is set, return it; otherwise exit nonzero like docker would.
+            # Emit docker-style JSON when a label is configured; exit nonzero otherwise.
             if [ -n "${FAKE_LABEL:-}" ]; then
-                echo "$FAKE_LABEL"
+                printf '[{"Config":{"Labels":{"isoclaude.claude_version":"%s"}}}]\n' "$FAKE_LABEL"
                 exit 0
             fi
             exit 1
@@ -94,8 +94,10 @@ ok "wrapper sourced without executing main"
 section "detect_runtime"
 
 unset ISOCLAUDE_RUNTIME
-got="$(detect_runtime)"
-[ "$got" = "docker" ] && ok "auto-detects docker from PATH" || bad "auto-detect" "got '$got'"
+# Seal PATH to only the fakebin dir so a real container/orb/podman install
+# on the host doesn't shadow our fake docker.
+got="$(PATH="$TMP/fakebin" detect_runtime)"
+[ "$got" = "docker" ] && ok "auto-detects docker from sealed PATH" || bad "auto-detect" "got '$got'"
 
 export ISOCLAUDE_RUNTIME="docker"
 got="$(detect_runtime)"
@@ -219,9 +221,34 @@ compose_run_flags
 flags="${RUN_FLAGS[*]}"
 
 case "$flags" in
-    *"--rm -it"*) ok "passes --rm -it" ;;
-    *) bad "missing --rm -it" "flags: $flags" ;;
+    *"--rm"*) ok "passes --rm" ;;
+    *) bad "missing --rm" "flags: $flags" ;;
 esac
+# -i / -t are added independently and only when stdin/stdout are TTYs.
+# This test harness usually has no TTY, so verify the wrapper doesn't
+# blindly request -t when there's no terminal (would break Apple container).
+if [ -t 0 ]; then
+    case "$flags" in
+        *" -i "*|*" -i") ok "adds -i when stdin is a TTY" ;;
+        *) bad "missing -i with TTY stdin" "flags: $flags" ;;
+    esac
+else
+    case "$flags" in
+        *" -i "*|*" -i") bad "adds -i without a TTY" "flags: $flags" ;;
+        *) ok "omits -i when no TTY stdin (Apple container safe)" ;;
+    esac
+fi
+if [ -t 1 ]; then
+    case "$flags" in
+        *" -t "*|*" -t") ok "adds -t when stdout is a TTY" ;;
+        *) bad "missing -t with TTY stdout" "flags: $flags" ;;
+    esac
+else
+    case "$flags" in
+        *" -t "*|*" -t") bad "adds -t without a TTY" "flags: $flags" ;;
+        *) ok "omits -t when no TTY stdout (Apple container safe)" ;;
+    esac
+fi
 case "$flags" in
     *"-v $PWD:$PWD"*) ok "mounts \$PWD at same path" ;;
     *) bad "missing \$PWD mount" "flags: $flags" ;;

@@ -47,8 +47,11 @@ fi
 section "entrypoint.sh — required behavior"
 
 ep=image/entrypoint.sh
-grep -q 'usermod  *-u "\$HOST_UID" claude'  "$ep"  && ok "usermod -u runs"  || bad "missing usermod -u"
-grep -q 'groupmod -g .* claude'             "$ep"  && ok "groupmod -g runs" || bad "missing groupmod -g"
+grep -q 'usermod -u'                        "$ep"  && ok "usermod -u runs"   || bad "missing usermod -u"
+grep -q 'groupmod -g'                       "$ep"  && ok "groupmod -g runs"  || bad "missing groupmod -g"
+grep -q 'usermod -g'                        "$ep"  && ok "handles GID collisions via usermod -g" || bad "no GID-collision handling"
+grep -q 'getent group'                      "$ep"  && ok "probes existing groups before remap" || bad "missing getent group probe"
+grep -q 'getent passwd'                     "$ep"  && ok "probes existing users before UID remap" || bad "missing getent passwd probe"
 grep -q 'exec gosu claude'                  "$ep"  && ok "exec gosu drops privs" || bad "missing exec gosu"
 grep -q '\! -name .claude'                  "$ep"  && ok "skips .claude bind mount on chown" || bad "would chown bind-mounted .claude"
 grep -q '\! -name .gitconfig'               "$ep"  && ok "skips .gitconfig bind mount on chown" || bad "would chown ro .gitconfig mount"
@@ -94,27 +97,59 @@ if [ -z "${runtime:-}" ]; then
 else
     v="2.1.143"
     printf '  using runtime: %s\n' "$runtime"
+    # Disable set -e for the live-build section so a runtime-specific quirk
+    # (like Apple container exiting nonzero on an unknown flag) doesn't bail
+    # the whole script — we want all checks to report independently.
+    set +e
+
     if "$runtime" build --build-arg "CLAUDE_VERSION=$v" \
                   -t isoclaude-base-test:latest \
                   -f image/Dockerfile.base image/ >/tmp/iso-build.log 2>&1; then
         ok "image builds with CLAUDE_VERSION=$v"
-        # Verify label was written
-        got=$("$runtime" image inspect --format '{{ index .Config.Labels "isoclaude.claude_version" }}' isoclaude-base-test:latest 2>/dev/null)
+
+        # Extract the label via JSON parsing (works on docker, podman, AND
+        # Apple container, the last of which has no --format support).
+        got=$("$runtime" image inspect isoclaude-base-test:latest 2>/dev/null | python3 -c '
+import sys, json
+try: data = json.load(sys.stdin)
+except Exception: sys.exit(0)
+KEY = "isoclaude.claude_version"
+def walk(o):
+    if isinstance(o, dict):
+        lab = o.get("Labels") or o.get("labels")
+        if isinstance(lab, dict) and lab.get(KEY): return lab[KEY]
+        for v in o.values():
+            r = walk(v)
+            if r: return r
+    elif isinstance(o, list):
+        for v in o:
+            r = walk(v)
+            if r: return r
+v = walk(data)
+if v: print(v)
+' 2>/dev/null)
         if [ "$got" = "$v" ]; then
             ok "image label matches build-arg ($got)"
         else
             bad "image label is '$got', expected '$v'"
         fi
-        # Verify claude is on PATH inside
-        if "$runtime" run --rm --entrypoint /bin/sh isoclaude-base-test:latest -c 'command -v claude && claude --version' | grep -q "$v"; then
-            ok "claude --version reports $v inside container"
+
+        # Run claude --version through the full entrypoint chain.
+        # Without HOST_UID set the usermod path is skipped; gosu still
+        # drops privs to the claude user, then runs `claude --version`.
+        out=$("$runtime" run --rm isoclaude-base-test:latest claude --version 2>&1)
+        if printf '%s\n' "$out" | grep -q "$v"; then
+            ok "claude --version reports $v inside container (full entrypoint)"
         else
-            bad "claude not runnable or wrong version inside container"
+            bad "claude --version output didn't contain '$v': $out"
         fi
-        "$runtime" image rm isoclaude-base-test:latest >/dev/null 2>&1 || true
+
+        "$runtime" image rm isoclaude-base-test:latest >/dev/null 2>&1
     else
         bad "image build failed; see /tmp/iso-build.log"
     fi
+
+    set -e
 fi
 
 #-----------------------------------------------------------------------

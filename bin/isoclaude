@@ -115,12 +115,35 @@ read_pin() {
 }
 
 # Returns the version label of the base image, or empty if missing.
+# Parses JSON rather than using --format because Apple's `container` CLI
+# doesn't support --format on image inspect. JSON parsing works on both
+# docker (root .Config.Labels) and Apple container (nested
+# .variants[].config.config.Labels) via a recursive walk.
 image_label_version() {
     local runtime="$1"
-    "$runtime" image inspect \
-        --format '{{ index .Config.Labels "isoclaude.claude_version" }}' \
-        "$ISOCLAUDE_BASE_IMAGE" 2>/dev/null \
-        || true
+    "$runtime" image inspect "$ISOCLAUDE_BASE_IMAGE" 2>/dev/null | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+KEY = "isoclaude.claude_version"
+def walk(obj):
+    if isinstance(obj, dict):
+        labels = obj.get("Labels") or obj.get("labels")
+        if isinstance(labels, dict) and labels.get(KEY):
+            return labels[KEY]
+        for v in obj.values():
+            r = walk(v)
+            if r: return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = walk(v)
+            if r: return r
+    return None
+v = walk(data)
+if v: print(v)
+' 2>/dev/null || true
 }
 
 # Build the base image if missing or if its label doesn't match the target.
@@ -149,7 +172,12 @@ _add_mount()  { _add "-v" "$1"; }
 
 compose_run_flags() {
     RUN_FLAGS=()
-    _add "--rm" "-it"
+    _add "--rm"
+    # Allocate interactive stdin / tty only when this shell actually has
+    # them. Apple `container` errors with ENODEV if -t is requested without
+    # a real tty, and docker just suppresses input echo unnecessarily.
+    [ -t 0 ] && _add "-i"
+    [ -t 1 ] && _add "-t"
 
     # Working dir: bind-mount $PWD at same path and CD there.
     _add_mount "$PWD:$PWD"
