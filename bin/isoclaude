@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# isoclaude — run Claude Code in a sandboxed container.
+#
+# Phase 2 surface: default run path only. Subcommands (init/update/pin/
+# version/shell/build) are added in Phase 3, project-level config overlays
+# in Phase 4, and the installer in Phase 5.
+#
+# Compatible with bash 3.2 (macOS default). Avoids mapfile, lone arr[@]
+# under set -u, etc.
+
+set -eo pipefail
+
+ISOCLAUDE_HOME="${ISOCLAUDE_HOME:-$HOME/.isoclaude}"
+ISOCLAUDE_BASE_IMAGE="${ISOCLAUDE_BASE_IMAGE:-isoclaude-base:latest}"
+NPM_PACKAGE="@anthropic-ai/claude-code"
+
+# Globals populated by compose_*; consumed by run_default.
+RUN_FLAGS=()
+
+log()  { printf '\033[2misoclaude:\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[33misoclaude:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[31misoclaude:\033[0m %s\n' "$*" >&2; exit 1; }
+
+script_dir() {
+    # Resolve $0 through any symlinks to find the script's real dir.
+    local src="${BASH_SOURCE[0]}" dir
+    while [ -L "$src" ]; do
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+    done
+    cd -P "$(dirname "$src")" && pwd
+}
+
+detect_runtime() {
+    if [ -n "${ISOCLAUDE_RUNTIME:-}" ]; then
+        command -v "$ISOCLAUDE_RUNTIME" >/dev/null 2>&1 \
+            || die "ISOCLAUDE_RUNTIME=$ISOCLAUDE_RUNTIME not on PATH"
+        printf '%s\n' "$ISOCLAUDE_RUNTIME"
+        return
+    fi
+    local r
+    for r in container orb docker podman; do
+        if command -v "$r" >/dev/null 2>&1; then
+            printf '%s\n' "$r"
+            return
+        fi
+    done
+    die "no container runtime found (looked for: container, orb, docker, podman)"
+}
+
+# Walk up from PWD looking for a .isoclaude/ directory. Stops at $HOME and /.
+project_root() {
+    local dir="$PWD"
+    while :; do
+        if [ -d "$dir/.isoclaude" ]; then
+            printf '%s\n' "$dir"
+            return
+        fi
+        if [ "$dir" = "/" ] || [ "$dir" = "$HOME" ]; then
+            return
+        fi
+        dir="$(dirname "$dir")"
+    done
+}
+
+# Ensure $ISOCLAUDE_HOME contains Dockerfile.base and entrypoint.sh.
+# In dev (running from the repo) we auto-copy from ../image/. After install
+# the installer puts them there.
+ensure_iso_home() {
+    if [ -f "$ISOCLAUDE_HOME/Dockerfile.base" ] && [ -f "$ISOCLAUDE_HOME/entrypoint.sh" ]; then
+        return
+    fi
+    mkdir -p "$ISOCLAUDE_HOME"
+    local src
+    src="$(script_dir)/../image"
+    if [ -f "$src/Dockerfile.base" ] && [ -f "$src/entrypoint.sh" ]; then
+        log "first run: seeding $ISOCLAUDE_HOME from $src"
+        cp "$src/Dockerfile.base" "$ISOCLAUDE_HOME/Dockerfile.base"
+        cp "$src/entrypoint.sh"   "$ISOCLAUDE_HOME/entrypoint.sh"
+    else
+        die "$ISOCLAUDE_HOME is missing image files and no dev source found; run install.sh"
+    fi
+}
+
+# Strip whitespace from a file's contents.
+_read_trimmed() { tr -d '[:space:]' < "$1"; }
+
+# Resolve the target claude version: project pin > global pin > npm latest.
+# Side-effect: if no pin exists anywhere, query npm and write the global pin.
+read_pin() {
+    local proj v
+    proj="$(project_root)"
+    if [ -n "$proj" ] && [ -f "$proj/.isoclaude/claude-version" ]; then
+        v="$(_read_trimmed "$proj/.isoclaude/claude-version")"
+        [ -n "$v" ] || die "$proj/.isoclaude/claude-version is empty"
+        printf '%s\n' "$v"
+        return
+    fi
+    if [ -f "$ISOCLAUDE_HOME/claude-version" ]; then
+        v="$(_read_trimmed "$ISOCLAUDE_HOME/claude-version")"
+        [ -n "$v" ] || die "$ISOCLAUDE_HOME/claude-version is empty"
+        printf '%s\n' "$v"
+        return
+    fi
+    command -v npm >/dev/null 2>&1 \
+        || die "no version pinned and 'npm' not on PATH to discover latest"
+    log "no pin set, querying npm for latest $NPM_PACKAGE"
+    v="$(npm view "$NPM_PACKAGE" version --silent 2>/dev/null)" \
+        || die "failed to query npm for latest $NPM_PACKAGE"
+    [ -n "$v" ] || die "npm returned empty version for $NPM_PACKAGE"
+    printf '%s\n' "$v" > "$ISOCLAUDE_HOME/claude-version"
+    log "wrote global pin: $v"
+    printf '%s\n' "$v"
+}
+
+# Returns the version label of the base image, or empty if missing.
+image_label_version() {
+    local runtime="$1"
+    "$runtime" image inspect \
+        --format '{{ index .Config.Labels "isoclaude.claude_version" }}' \
+        "$ISOCLAUDE_BASE_IMAGE" 2>/dev/null \
+        || true
+}
+
+# Build the base image if missing or if its label doesn't match the target.
+ensure_base_image() {
+    local runtime="$1" target="$2" current
+    current="$(image_label_version "$runtime")"
+    if [ "$current" = "$target" ]; then
+        return
+    fi
+    if [ -z "$current" ]; then
+        log "building $ISOCLAUDE_BASE_IMAGE @ $target (first build, may take a minute)"
+    else
+        log "pin changed ($current -> $target), rebuilding $ISOCLAUDE_BASE_IMAGE"
+    fi
+    "$runtime" build \
+        --build-arg "CLAUDE_VERSION=$target" \
+        -t "$ISOCLAUDE_BASE_IMAGE" \
+        -f "$ISOCLAUDE_HOME/Dockerfile.base" \
+        "$ISOCLAUDE_HOME" \
+        || die "image build failed"
+}
+
+# Appends to RUN_FLAGS in-place.
+_add()        { RUN_FLAGS=( "${RUN_FLAGS[@]}" "$@" ); }
+_add_mount()  { _add "-v" "$1"; }
+
+compose_run_flags() {
+    RUN_FLAGS=()
+    _add "--rm" "-it"
+
+    # Working dir: bind-mount $PWD at same path and CD there.
+    _add_mount "$PWD:$PWD"
+    _add "-w" "$PWD"
+
+    # Auth/credentials (rw so login persists).
+    _add_mount "$HOME/.claude:/home/claude/.claude"
+
+    # Git config (ro).
+    if [ -f "$HOME/.gitconfig" ]; then
+        _add_mount "$HOME/.gitconfig:/home/claude/.gitconfig:ro"
+    else
+        warn "$HOME/.gitconfig not found; commits inside the sandbox won't have your name/email"
+    fi
+
+    # SSH (ro).
+    if [ -d "$HOME/.ssh" ]; then
+        _add_mount "$HOME/.ssh:/home/claude/.ssh:ro"
+    else
+        warn "$HOME/.ssh not found; git push over ssh won't work from the sandbox"
+    fi
+
+    # Env: UID/GID for the entrypoint, plus terminal hints.
+    _add "-e" "HOST_UID=$(id -u)"
+    _add "-e" "HOST_GID=$(id -g)"
+    _add "-e" "TERM"
+    _add "-e" "COLORTERM"
+}
+
+# Default action: launch claude in the sandbox. Honors ISOCLAUDE_DRY_RUN
+# to print the full runtime invocation without executing.
+run_default() {
+    local runtime="$1"; shift
+    compose_run_flags
+    if [ -n "${ISOCLAUDE_DRY_RUN:-}" ]; then
+        printf '%s' "$runtime run"
+        printf ' %q' "${RUN_FLAGS[@]}" "$ISOCLAUDE_BASE_IMAGE" "claude" "$@"
+        printf '\n'
+        return 0
+    fi
+    exec "$runtime" run "${RUN_FLAGS[@]}" "$ISOCLAUDE_BASE_IMAGE" claude "$@"
+}
+
+main() {
+    local runtime pin
+    runtime="$(detect_runtime)"
+    ensure_iso_home
+    pin="$(read_pin)"
+    ensure_base_image "$runtime" "$pin"
+    run_default "$runtime" "$@"
+}
+
+# Only run main when executed directly, not when sourced (for tests).
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    main "$@"
+fi
