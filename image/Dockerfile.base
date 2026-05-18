@@ -23,6 +23,12 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_VERSION}"
 RUN groupadd -g 1000 claude \
  && useradd -m -u 1000 -g 1000 -s /bin/bash claude
 
+# Some bind-mount runtimes (notably Apple `container`) present the mount-
+# point directory as root-owned even when its contents have the correct
+# UIDs. Git's safe.directory check then rejects any repo at the mount
+# root. Inside an explicit sandbox we trust whatever's mounted in.
+RUN git config --system --add safe.directory '*'
+
 COPY entrypoint.sh /usr/local/bin/isoclaude-entrypoint
 RUN chmod +x /usr/local/bin/isoclaude-entrypoint
 

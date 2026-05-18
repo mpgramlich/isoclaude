@@ -69,6 +69,7 @@ grep -q 'npm install -g .*@anthropic-ai/claude-code@'  "$df" && ok "installs pin
 grep -q 'gosu'                              "$df" && ok "installs gosu"                  || bad "gosu missing from apt install"
 grep -q 'nodesource'                        "$df" && ok "uses nodesource for node 22"    || bad "node install line missing"
 grep -q 'useradd .*-u 1000 .*claude'        "$df" && ok "creates claude user at UID 1000" || bad "no useradd for claude"
+grep -q "safe.directory '\*'"               "$df" && ok "git safe.directory configured for bind mounts" || bad "missing git safe.directory"
 grep -q 'COPY entrypoint.sh'                "$df" && ok "copies entrypoint into image"   || bad "entrypoint not copied"
 grep -q '^LABEL isoclaude.claude_version='  "$df" && ok "tags image with version label"  || bad "missing version label"
 grep -q '^ENTRYPOINT'                       "$df" && ok "sets ENTRYPOINT"                || bad "missing ENTRYPOINT"

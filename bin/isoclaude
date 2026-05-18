@@ -64,23 +64,35 @@ project_root() {
     done
 }
 
-# Ensure $ISOCLAUDE_HOME contains Dockerfile.base and entrypoint.sh.
-# In dev (running from the repo) we auto-copy from ../image/. After install
-# the installer puts them there.
-ensure_iso_home() {
-    if [ -f "$ISOCLAUDE_HOME/Dockerfile.base" ] && [ -f "$ISOCLAUDE_HOME/entrypoint.sh" ]; then
-        return
+# Sync $1 to $2 only when contents differ (preserves mtime when unchanged,
+# so docker's build cache isn't invalidated by no-op syncs).
+_sync_if_diff() {
+    if ! cmp -s "$1" "$2" 2>/dev/null; then
+        cp "$1" "$2"
+        return 0
     fi
+    return 1
+}
+
+# Ensure $ISOCLAUDE_HOME contains Dockerfile.base and entrypoint.sh.
+# When invoked from the repo (script_dir/../image exists) the repo wins,
+# so edits to the source are picked up on the next run. After install the
+# installer is the source of truth and we just verify the files are there.
+ensure_iso_home() {
     mkdir -p "$ISOCLAUDE_HOME"
     local src
     src="$(script_dir)/../image"
     if [ -f "$src/Dockerfile.base" ] && [ -f "$src/entrypoint.sh" ]; then
-        log "first run: seeding $ISOCLAUDE_HOME from $src"
-        cp "$src/Dockerfile.base" "$ISOCLAUDE_HOME/Dockerfile.base"
-        cp "$src/entrypoint.sh"   "$ISOCLAUDE_HOME/entrypoint.sh"
-    else
+        local synced=0
+        _sync_if_diff "$src/Dockerfile.base" "$ISOCLAUDE_HOME/Dockerfile.base" && synced=1
+        _sync_if_diff "$src/entrypoint.sh"   "$ISOCLAUDE_HOME/entrypoint.sh"   && synced=1
+        [ "$synced" -eq 1 ] && log "synced $ISOCLAUDE_HOME from $src"
+        return 0
+    fi
+    if [ ! -f "$ISOCLAUDE_HOME/Dockerfile.base" ] || [ ! -f "$ISOCLAUDE_HOME/entrypoint.sh" ]; then
         die "$ISOCLAUDE_HOME is missing image files and no dev source found; run install.sh"
     fi
+    return 0
 }
 
 # Strip whitespace from a file's contents.
