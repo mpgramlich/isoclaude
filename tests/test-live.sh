@@ -223,5 +223,43 @@ else
 fi
 
 #-----------------------------------------------------------------------
+section "Phase 3 subcommands against real runtime"
+
+# `version` should report runtime + image label, and not crash.
+out=$(cd "$TMP/proj" && \
+      ISOCLAUDE_HOME="$ISO_HOME" \
+      ISOCLAUDE_BASE_IMAGE="$WRAPPER_IMG" \
+      ISOCLAUDE_RUNTIME="$runtime" \
+      "$WRAPPER" version 2>&1)
+case "$out" in
+    *"global pin:"*"$V"*"image label:"*"$V"*"runtime:"*"$runtime"*)
+        ok "version reports pin, label, and runtime correctly" ;;
+    *) bad "version output" "got: $out" ;;
+esac
+
+# `init` should create the scaffold idempotently.
+init_dir="$TMP/init-target"
+mkdir -p "$init_dir"
+( cd "$init_dir" && \
+      ISOCLAUDE_HOME="$ISO_HOME" \
+      ISOCLAUDE_RUNTIME="$runtime" \
+      "$WRAPPER" init >/dev/null 2>&1 )
+[ -f "$init_dir/.isoclaude/Dockerfile" ] && [ -f "$init_dir/.isoclaude/env" ] \
+    && ok "init scaffolds .isoclaude/ end-to-end" || bad "init missed files"
+
+# `shell` should launch bash. We use a one-shot command (-c) so it exits
+# immediately rather than blocking on a prompt.
+out=$(cd "$TMP/proj" && \
+      ISOCLAUDE_HOME="$ISO_HOME" \
+      ISOCLAUDE_BASE_IMAGE="$WRAPPER_IMG" \
+      ISOCLAUDE_RUNTIME="$runtime" \
+      "$WRAPPER" shell -c 'echo bash-says hello; id -un' 2>&1)
+case "$out" in
+    *bash-says\ hello*claude*)
+        ok "shell runs bash inside container as claude user" ;;
+    *) bad "shell exec" "got: $out" ;;
+esac
+
+#-----------------------------------------------------------------------
 printf '\n\033[1mLive: %d passed, %d failed\033[0m\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

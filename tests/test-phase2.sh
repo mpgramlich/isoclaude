@@ -298,10 +298,10 @@ esac
 mkdir -p "$HOME/.ssh"; echo k > "$HOME/.ssh/id_ed25519"; echo "[user]" > "$HOME/.gitconfig"
 
 #-----------------------------------------------------------------------
-section "run_default with ISOCLAUDE_DRY_RUN"
+section "_exec_in_sandbox with ISOCLAUDE_DRY_RUN"
 
 cd "$TMP/proj"
-ISOCLAUDE_DRY_RUN=1 out="$(run_default docker --foo --bar)"
+ISOCLAUDE_DRY_RUN=1 out="$(_exec_in_sandbox docker claude --foo --bar)"
 case "$out" in
     "docker run "*) ok "dry-run starts with 'docker run'" ;;
     *) bad "dry-run prefix" "got: $out" ;;
@@ -311,8 +311,15 @@ case "$out" in
     *) bad "dry-run image" "got: $out" ;;
 esac
 case "$out" in
-    *claude*--foo*--bar*) ok "dry-run appends user args after 'claude'" ;;
+    *claude*--foo*--bar*) ok "dry-run appends user args after the entry" ;;
     *) bad "dry-run args" "got: $out" ;;
+esac
+
+# Same machinery should be able to run a different entry command (used by cmd_shell).
+ISOCLAUDE_DRY_RUN=1 out="$(_exec_in_sandbox docker bash -l)"
+case "$out" in
+    *isoclaude-base:test\ bash\ -l) ok "dry-run honors a non-claude entry (bash -l)" ;;
+    *) bad "alternate entry" "got: $out" ;;
 esac
 
 #-----------------------------------------------------------------------

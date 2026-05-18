@@ -207,27 +207,242 @@ compose_run_flags() {
     _add "-e" "COLORTERM"
 }
 
-# Default action: launch claude in the sandbox. Honors ISOCLAUDE_DRY_RUN
-# to print the full runtime invocation without executing.
-run_default() {
-    local runtime="$1"; shift
+# Exec the given entry command (claude, bash, ...) inside the sandbox.
+# Honors ISOCLAUDE_DRY_RUN to print the runtime invocation without execing.
+_exec_in_sandbox() {
+    local runtime="$1" entry="$2"; shift 2
     compose_run_flags
     if [ -n "${ISOCLAUDE_DRY_RUN:-}" ]; then
         printf '%s' "$runtime run"
-        printf ' %q' "${RUN_FLAGS[@]}" "$ISOCLAUDE_BASE_IMAGE" "claude" "$@"
+        printf ' %q' "${RUN_FLAGS[@]}" "$ISOCLAUDE_BASE_IMAGE" "$entry" "$@"
         printf '\n'
         return 0
     fi
-    exec "$runtime" run "${RUN_FLAGS[@]}" "$ISOCLAUDE_BASE_IMAGE" claude "$@"
+    exec "$runtime" run "${RUN_FLAGS[@]}" "$ISOCLAUDE_BASE_IMAGE" "$entry" "$@"
+}
+
+# Resolve runtime + pin + ensure the base image is built. Used by every
+# subcommand that launches a container or builds an image.
+_prepare() {
+    RUNTIME="$(detect_runtime)"
+    ensure_iso_home
+    PIN="$(read_pin)"
+    ensure_base_image "$RUNTIME" "$PIN"
+}
+
+cmd_run() {
+    _prepare
+    _exec_in_sandbox "$RUNTIME" claude "$@"
+}
+
+cmd_shell() {
+    _prepare
+    _exec_in_sandbox "$RUNTIME" bash "$@"
+}
+
+cmd_init() {
+    local dir="$PWD/.isoclaude"
+    if [ -d "$dir" ]; then
+        log "$dir already exists; only creating any missing files"
+    fi
+    mkdir -p "$dir/local"
+
+    _scaffold "$dir/Dockerfile" <<'EOF'
+# Optional: extend the isoclaude base image with project-specific tools.
+# Uncomment, edit, and re-run `isoclaude build` to pick up changes.
+#
+# FROM isoclaude-base:latest
+# USER root
+# RUN apt-get update && apt-get install -y --no-install-recommends \
+#         python3 python3-pip \
+#  && rm -rf /var/lib/apt/lists/*
+# USER claude
+EOF
+
+    _scaffold "$dir/env" <<'EOF'
+# KEY=VALUE lines passed into the sandbox as env vars. `#` comments OK.
+# Put per-developer overrides in local/env (gitignored).
+#
+# EXAMPLE_API_KEY=...
+EOF
+
+    _scaffold "$dir/mounts" <<'EOF'
+# Extra bind mounts, one spec per line. `~` is expanded host-side. `#` comments OK.
+# Format: /host/path:/container/path[:ro]
+# Put per-developer mounts in local/mounts (gitignored).
+#
+# ~/.cache/pip:/home/claude/.cache/pip
+EOF
+
+    _scaffold "$dir/.gitignore" <<'EOF'
+local/
+EOF
+
+    _scaffold "$dir/local/.gitkeep" <<'EOF'
+EOF
+
+    log "initialized $dir"
+    log "next: edit Dockerfile/env/mounts as needed, then run isoclaude"
+}
+
+# Write file with the given content from stdin only if it doesn't exist.
+_scaffold() {
+    local path="$1"
+    if [ -e "$path" ]; then
+        log "  skip (exists): ${path#$PWD/}"
+        cat >/dev/null  # drain stdin
+    else
+        cat > "$path"
+        log "  wrote:        ${path#$PWD/}"
+    fi
+}
+
+cmd_build() {
+    RUNTIME="$(detect_runtime)"
+    ensure_iso_home
+    PIN="$(read_pin)"
+    log "force rebuild of $ISOCLAUDE_BASE_IMAGE @ $PIN"
+    "$RUNTIME" image rm "$ISOCLAUDE_BASE_IMAGE" >/dev/null 2>&1 || true
+    ensure_base_image "$RUNTIME" "$PIN"
+    log "build complete"
+}
+
+cmd_version() {
+    local runtime proj global_pin project_pin image_v latest
+    runtime="$(detect_runtime 2>/dev/null || true)"
+    proj="$(project_root)"
+
+    if [ -f "$ISOCLAUDE_HOME/claude-version" ]; then
+        global_pin="$(_read_trimmed "$ISOCLAUDE_HOME/claude-version")"
+    fi
+    if [ -n "$proj" ] && [ -f "$proj/.isoclaude/claude-version" ]; then
+        project_pin="$(_read_trimmed "$proj/.isoclaude/claude-version")"
+    fi
+    if [ -n "$runtime" ]; then
+        image_v="$(image_label_version "$runtime")"
+    fi
+    if command -v npm >/dev/null 2>&1; then
+        latest="$(npm view "$NPM_PACKAGE" version --silent 2>/dev/null || true)"
+    fi
+
+    printf 'global pin:    %s\n' "${global_pin:-<unset>}"
+    printf 'project pin:   %s\n' "${project_pin:-<unset>}"
+    printf 'image label:   %s\n' "${image_v:-<not built>}"
+    printf 'latest on npm: %s\n' "${latest:-<unknown>}"
+    if [ -n "$proj" ]; then
+        printf 'project root:  %s\n' "$proj"
+    fi
+    printf 'runtime:       %s\n' "${runtime:-<none found>}"
+}
+
+cmd_update() {
+    if [ "${1:-}" = "--check" ]; then
+        ensure_iso_home
+        local global latest
+        [ -f "$ISOCLAUDE_HOME/claude-version" ] \
+            && global="$(_read_trimmed "$ISOCLAUDE_HOME/claude-version")"
+        command -v npm >/dev/null 2>&1 || die "'npm' not on PATH"
+        latest="$(npm view "$NPM_PACKAGE" version --silent 2>/dev/null)" \
+            || die "failed to query npm"
+        printf 'current global pin: %s\n' "${global:-<unset>}"
+        printf 'latest on npm:      %s\n' "$latest"
+        if [ "$global" = "$latest" ]; then
+            printf 'up to date.\n'
+        else
+            printf 'run `isoclaude update` to bump.\n'
+        fi
+        return
+    fi
+
+    local version="${1:-}"
+    ensure_iso_home
+    if [ -z "$version" ]; then
+        command -v npm >/dev/null 2>&1 || die "'npm' not on PATH; pass a version explicitly"
+        log "querying npm for latest $NPM_PACKAGE"
+        version="$(npm view "$NPM_PACKAGE" version --silent 2>/dev/null)" \
+            || die "failed to query npm"
+    fi
+    printf '%s\n' "$version" > "$ISOCLAUDE_HOME/claude-version"
+    log "global pin set to $version"
+
+    local runtime
+    runtime="$(detect_runtime)"
+    ensure_base_image "$runtime" "$version"
+}
+
+cmd_pin() {
+    local version="${1:-}" proj
+    ensure_iso_home
+    proj="$(project_root)"
+    if [ -z "$proj" ]; then
+        proj="$PWD"
+        log "no .isoclaude/ found above $PWD; creating one at $proj"
+        mkdir -p "$proj/.isoclaude"
+    fi
+
+    if [ -z "$version" ]; then
+        if [ ! -f "$ISOCLAUDE_HOME/claude-version" ]; then
+            die "no global pin set; pass a version explicitly"
+        fi
+        version="$(_read_trimmed "$ISOCLAUDE_HOME/claude-version")"
+    fi
+
+    printf '%s\n' "$version" > "$proj/.isoclaude/claude-version"
+    log "project pin set to $version at $proj/.isoclaude/claude-version"
+
+    local runtime
+    runtime="$(detect_runtime)"
+    ensure_base_image "$runtime" "$version"
+}
+
+cmd_help() {
+    cat <<'EOF'
+isoclaude — run Claude Code in a sandboxed container.
+
+USAGE
+    isoclaude [SUBCOMMAND] [ARGS...]
+
+DEFAULT
+    With no subcommand (or with `run`), launches claude in the sandbox
+    with PWD mounted plus ~/.claude (rw), ~/.gitconfig (ro), and ~/.ssh
+    (ro). Args after `run` (or after `--`) are passed to claude.
+
+SUBCOMMANDS
+    run [ARGS]              Explicit form of the default.
+    shell [ARGS]            Launch a bash shell in the sandbox.
+    init                    Scaffold .isoclaude/ in the current dir.
+    build                   Force-rebuild the base image at the current pin.
+    version                 Show global pin, project pin, image label,
+                            npm latest, project root, runtime.
+    update [VERSION]        Update global pin to VERSION (default: npm
+                            latest) and rebuild.
+    update --check          Compare global pin to npm latest, no changes.
+    pin [VERSION]           Set per-project pin to VERSION (default:
+                            current global pin) and rebuild.
+    help                    Show this message.
+
+ENVIRONMENT
+    ISOCLAUDE_HOME           Override the install dir (default: ~/.isoclaude).
+    ISOCLAUDE_RUNTIME        Force a specific runtime (e.g. docker, container).
+    ISOCLAUDE_BASE_IMAGE     Override base image tag.
+    ISOCLAUDE_DRY_RUN=1      Print the runtime invocation; don't exec.
+EOF
 }
 
 main() {
-    local runtime pin
-    runtime="$(detect_runtime)"
-    ensure_iso_home
-    pin="$(read_pin)"
-    ensure_base_image "$runtime" "$pin"
-    run_default "$runtime" "$@"
+    case "${1:-}" in
+        run)            shift; cmd_run "$@" ;;
+        shell)          shift; cmd_shell "$@" ;;
+        init)           shift; cmd_init "$@" ;;
+        build)          shift; cmd_build "$@" ;;
+        version)        shift; cmd_version "$@" ;;
+        update)         shift; cmd_update "$@" ;;
+        pin)            shift; cmd_pin "$@" ;;
+        help|-h|--help) cmd_help ;;
+        --)             shift; cmd_run "$@" ;;
+        "")             cmd_run ;;
+        *)              cmd_run "$@" ;;
+    esac
 }
 
 # Only run main when executed directly, not when sourced (for tests).
