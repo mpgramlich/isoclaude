@@ -261,5 +261,55 @@ case "$out" in
 esac
 
 #-----------------------------------------------------------------------
+section "Phase 4 overlays end-to-end (env, mounts, project Dockerfile)"
+
+# Build a project that exercises all three overlays.
+proj4="$TMP/proj4"
+mkdir -p "$proj4/.isoclaude/local"
+
+echo 'COMMITTED_VAR=from-committed' > "$proj4/.isoclaude/env"
+echo 'COMMITTED_VAR=from-local'     > "$proj4/.isoclaude/local/env"   # later wins
+echo 'LOCAL_ONLY=yes'              >> "$proj4/.isoclaude/local/env"
+
+mkdir -p "$TMP/extra-data"
+echo "marker" > "$TMP/extra-data/marker.txt"
+echo "$TMP/extra-data:/extra:ro" > "$proj4/.isoclaude/mounts"
+
+cat > "$proj4/.isoclaude/Dockerfile" <<'EOF'
+FROM isoclaude-base:latest
+RUN echo project-layer-mark > /etc/iso-project-mark
+EOF
+
+# Run from inside the project dir so project_root + project Dockerfile fire.
+out=$(cd "$proj4" && \
+      ISOCLAUDE_HOME="$ISO_HOME" \
+      ISOCLAUDE_BASE_IMAGE="$WRAPPER_IMG" \
+      ISOCLAUDE_RUNTIME="$runtime" \
+      "$WRAPPER" shell -c 'echo "COMMITTED=$COMMITTED_VAR"; echo "LOCAL=$LOCAL_ONLY"; cat /extra/marker.txt; echo "MARK=$(cat /etc/iso-project-mark)"' 2>&1)
+
+case "$out" in
+    *COMMITTED=from-local*) ok "local env overrides committed env at runtime" ;;
+    *COMMITTED=from-committed*) bad "local env did not override" "got: $out" ;;
+    *) bad "env var not set" "got: $out" ;;
+esac
+case "$out" in
+    *LOCAL=yes*) ok "local-only env var visible inside container" ;;
+    *) bad "local-only var missing" "got: $out" ;;
+esac
+case "$out" in
+    *marker*) ok "extra bind mount is readable inside" ;;
+    *) bad "extra mount missing" "got: $out" ;;
+esac
+case "$out" in
+    *MARK=project-layer-mark*) ok "project Dockerfile layer is applied (file added by RUN visible)" ;;
+    *) bad "project image not used" "got: $out" ;;
+esac
+
+# Clean up the project images we built so they don't accumulate.
+for img in $("$runtime" image list 2>/dev/null | awk '/^isoclaude-project-/ {print $1":"$2}'); do
+    "$runtime" image rm "$img" >/dev/null 2>&1 || true
+done
+
+#-----------------------------------------------------------------------
 printf '\n\033[1mLive: %d passed, %d failed\033[0m\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

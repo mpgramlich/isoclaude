@@ -217,29 +217,109 @@ compose_run_flags() {
     _add "-e" "HOST_GID=$(id -g)"
     _add "-e" "TERM"
     _add "-e" "COLORTERM"
+
+    # Project-level overlays: env-files and extra mounts. local/ overrides
+    # the committed copy by being listed second (docker takes later values).
+    if [ -n "${PROJECT_ROOT:-}" ]; then
+        local d="$PROJECT_ROOT/.isoclaude"
+        [ -f "$d/env"       ] && _add "--env-file" "$d/env"
+        [ -f "$d/local/env" ] && _add "--env-file" "$d/local/env"
+        _add_project_mounts "$d/mounts"
+        _add_project_mounts "$d/local/mounts"
+    fi
+}
+
+# Read a mounts file, one spec per line, format: /host:/container[:ro|:rw].
+# Skips comments and blank lines, expands a leading ~ in the host path.
+_add_project_mounts() {
+    local file="$1" line host rest
+    [ -f "$file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        case "$line" in ""|"#"*) continue ;; esac
+        case "$line" in
+            *:*) ;;
+            *)   warn "skipping invalid mount line in $file: $line"; continue ;;
+        esac
+        host="${line%%:*}"
+        rest="${line#*:}"
+        case "$host" in
+            "~")    host="$HOME" ;;
+            "~/"*)  host="$HOME/${host#\~/}" ;;
+        esac
+        _add_mount "$host:$rest"
+    done < "$file"
 }
 
 # Exec the given entry command (claude, bash, ...) inside the sandbox.
+# Uses RUN_IMAGE (the project overlay if one exists, otherwise the base).
 # Honors ISOCLAUDE_DRY_RUN to print the runtime invocation without execing.
 _exec_in_sandbox() {
     local runtime="$1" entry="$2"; shift 2
     compose_run_flags
+    local image="${RUN_IMAGE:-$ISOCLAUDE_BASE_IMAGE}"
     if [ -n "${ISOCLAUDE_DRY_RUN:-}" ]; then
         printf '%s' "$runtime run"
-        printf ' %q' "${RUN_FLAGS[@]}" "$ISOCLAUDE_BASE_IMAGE" "$entry" "$@"
+        printf ' %q' "${RUN_FLAGS[@]}" "$image" "$entry" "$@"
         printf '\n'
         return 0
     fi
-    exec "$runtime" run "${RUN_FLAGS[@]}" "$ISOCLAUDE_BASE_IMAGE" "$entry" "$@"
+    exec "$runtime" run "${RUN_FLAGS[@]}" "$image" "$entry" "$@"
 }
 
-# Resolve runtime + pin + ensure the base image is built. Used by every
-# subcommand that launches a container or builds an image.
+# Build the per-project image when .isoclaude/Dockerfile exists with a
+# real FROM line. Tagged by content hash so changes get a fresh image
+# automatically. Sets RUN_IMAGE on success.
+ensure_project_image() {
+    local runtime="$1" proj="$2"
+    local dockerfile="$proj/.isoclaude/Dockerfile"
+    [ -f "$dockerfile" ] || return 0
+    # Skip silently if the file has no FROM line yet (init scaffold).
+    grep -qE '^FROM[[:space:]]' "$dockerfile" || return 0
+    # Enforce the only legal base.
+    grep -qE '^FROM[[:space:]]+isoclaude-base:latest([[:space:]]|$)' "$dockerfile" \
+        || die "$dockerfile: project images must FROM isoclaude-base:latest"
+
+    local hash img
+    hash="$(_file_hash "$dockerfile")"
+    img="isoclaude-project-${hash}:latest"
+
+    # If the tagged image already exists, no rebuild needed.
+    if "$runtime" image inspect "$img" >/dev/null 2>&1; then
+        RUN_IMAGE="$img"
+        return 0
+    fi
+
+    log "building project image $img"
+    "$runtime" build \
+        -t "$img" \
+        -f "$dockerfile" \
+        "$proj/.isoclaude" \
+        || die "project image build failed"
+    RUN_IMAGE="$img"
+}
+
+# First 12 chars of sha256(file). Uses whichever of shasum/sha256sum is present.
+_file_hash() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -c1-12
+    else
+        shasum -a 256 "$1" | cut -c1-12
+    fi
+}
+
+# Resolve runtime + pin + project_root + ensure both base and (optional)
+# project images are built. Sets RUNTIME, PIN, PROJECT_ROOT, RUN_IMAGE.
 _prepare() {
     RUNTIME="$(detect_runtime)"
     ensure_iso_home
+    PROJECT_ROOT="$(project_root)"
     PIN="$(read_pin)"
     ensure_base_image "$RUNTIME" "$PIN"
+    RUN_IMAGE="$ISOCLAUDE_BASE_IMAGE"
+    if [ -n "$PROJECT_ROOT" ]; then
+        ensure_project_image "$RUNTIME" "$PROJECT_ROOT"
+    fi
 }
 
 cmd_run() {
@@ -312,10 +392,19 @@ _scaffold() {
 cmd_build() {
     RUNTIME="$(detect_runtime)"
     ensure_iso_home
+    PROJECT_ROOT="$(project_root)"
     PIN="$(read_pin)"
     log "force rebuild of $ISOCLAUDE_BASE_IMAGE @ $PIN"
     "$RUNTIME" image rm "$ISOCLAUDE_BASE_IMAGE" >/dev/null 2>&1 || true
     ensure_base_image "$RUNTIME" "$PIN"
+    if [ -n "$PROJECT_ROOT" ] && [ -f "$PROJECT_ROOT/.isoclaude/Dockerfile" ] \
+            && grep -qE '^FROM[[:space:]]' "$PROJECT_ROOT/.isoclaude/Dockerfile"; then
+        local hash img
+        hash="$(_file_hash "$PROJECT_ROOT/.isoclaude/Dockerfile")"
+        img="isoclaude-project-${hash}:latest"
+        "$RUNTIME" image rm "$img" >/dev/null 2>&1 || true
+        ensure_project_image "$RUNTIME" "$PROJECT_ROOT"
+    fi
     log "build complete"
 }
 
@@ -343,6 +432,16 @@ cmd_version() {
     printf 'latest on npm: %s\n' "${latest:-<unknown>}"
     if [ -n "$proj" ]; then
         printf 'project root:  %s\n' "$proj"
+        if [ -f "$proj/.isoclaude/Dockerfile" ] \
+                && grep -qE '^FROM[[:space:]]' "$proj/.isoclaude/Dockerfile"; then
+            local phash pimg pbuilt="no"
+            phash="$(_file_hash "$proj/.isoclaude/Dockerfile")"
+            pimg="isoclaude-project-${phash}:latest"
+            if [ -n "$runtime" ] && "$runtime" image inspect "$pimg" >/dev/null 2>&1; then
+                pbuilt="yes"
+            fi
+            printf 'project image: %s (built: %s)\n' "$pimg" "$pbuilt"
+        fi
     fi
     printf 'runtime:       %s\n' "${runtime:-<none found>}"
 }
