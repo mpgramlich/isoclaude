@@ -317,5 +317,68 @@ case "$out" in
 esac
 
 #-----------------------------------------------------------------------
+section "--yolo / -Y / ISOCLAUDE_YOLO -> --dangerously-skip-permissions"
+
+reset
+
+# Bare --yolo with no other args.
+out=$(cd "$TMP/proj" && RUN_WRAPPER --yolo 2>&1 | tail -1)
+case "$out" in
+    *"claude --dangerously-skip-permissions") ok "bare --yolo translates" ;;
+    *) bad "bare --yolo" "got: $out" ;;
+esac
+
+# --yolo before subcommand
+out=$(cd "$TMP/proj" && RUN_WRAPPER --yolo run --foo 2>&1 | tail -1)
+case "$out" in
+    *"claude --dangerously-skip-permissions --foo") ok "--yolo before subcommand" ;;
+    *) bad "--yolo before subcommand" "got: $out" ;;
+esac
+
+# --yolo after subcommand
+out=$(cd "$TMP/proj" && RUN_WRAPPER run --yolo --foo 2>&1 | tail -1)
+case "$out" in
+    *"claude --dangerously-skip-permissions --foo") ok "--yolo after subcommand" ;;
+    *) bad "--yolo after subcommand" "got: $out" ;;
+esac
+
+# -Y short alias.
+out=$(cd "$TMP/proj" && RUN_WRAPPER -Y --foo 2>&1 | tail -1)
+case "$out" in
+    *"claude --dangerously-skip-permissions --foo") ok "-Y short alias works" ;;
+    *) bad "-Y" "got: $out" ;;
+esac
+
+# ISOCLAUDE_YOLO=1 env var.
+out=$(cd "$TMP/proj" && ISOCLAUDE_YOLO=1 RUN_WRAPPER --foo 2>&1 | tail -1)
+case "$out" in
+    *"claude --dangerously-skip-permissions --foo") ok "ISOCLAUDE_YOLO=1 env var" ;;
+    *) bad "env var" "got: $out" ;;
+esac
+
+# No yolo (control): no flag added.
+out=$(cd "$TMP/proj" && RUN_WRAPPER --foo 2>&1 | tail -1)
+case "$out" in
+    *"--dangerously-skip-permissions"*) bad "added skip flag without --yolo" ;;
+    *"claude --foo") ok "no --yolo means no skip flag" ;;
+    *) bad "control case" "got: $out" ;;
+esac
+
+# --yolo with `shell` should NOT add the flag (bash doesn't know it).
+out=$(cd "$TMP/proj" && RUN_WRAPPER --yolo shell 2>&1 | tail -1)
+case "$out" in
+    *"--dangerously-skip-permissions"*) bad "--yolo leaked into shell command" ;;
+    *bash*) ok "--yolo is ignored by shell subcommand" ;;
+    *) bad "shell+yolo" "got: $out" ;;
+esac
+
+# --yolo with `init` is a no-op (init doesn't launch a container).
+out=$(cd "$TMP/proj/sub" 2>/dev/null || cd "$TMP/proj"; RUN_WRAPPER --yolo init 2>&1; echo "exit:$?")
+case "$out" in
+    *exit:0*) ok "--yolo + init runs cleanly (yolo is a no-op for non-run subcommands)" ;;
+    *) bad "init+yolo" "got: $out" ;;
+esac
+
+#-----------------------------------------------------------------------
 printf '\n\033[1mPhase 3: %d passed, %d failed\033[0m\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

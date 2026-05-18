@@ -324,7 +324,12 @@ _prepare() {
 
 cmd_run() {
     _prepare
-    _exec_in_sandbox "$RUNTIME" claude "$@"
+    if [ "${YOLO:-0}" = "1" ]; then
+        log "yolo: passing --dangerously-skip-permissions to claude"
+        _exec_in_sandbox "$RUNTIME" claude --dangerously-skip-permissions "$@"
+    else
+        _exec_in_sandbox "$RUNTIME" claude "$@"
+    fi
 }
 
 cmd_shell() {
@@ -532,15 +537,37 @@ SUBCOMMANDS
                             current global pin) and rebuild.
     help                    Show this message.
 
+GLOBAL FLAGS
+    --yolo, -Y              Pass --dangerously-skip-permissions to claude,
+                            so it stops asking for permission on every
+                            tool call. The sandbox is your safety net.
+                            Only affects `run` (the default); ignored by
+                            other subcommands. Strippable from anywhere
+                            in the args.
+
 ENVIRONMENT
     ISOCLAUDE_HOME           Override the install dir (default: ~/.isoclaude).
     ISOCLAUDE_RUNTIME        Force a specific runtime (e.g. docker, container).
     ISOCLAUDE_BASE_IMAGE     Override base image tag.
     ISOCLAUDE_DRY_RUN=1      Print the runtime invocation; don't exec.
+    ISOCLAUDE_YOLO=1         Same as passing --yolo on every invocation.
 EOF
 }
 
 main() {
+    # Scan for global flags (currently just --yolo / -Y), strip them, and
+    # remember in YOLO. Order-independent: works whether the flag comes
+    # before a subcommand, after it, or stands alone.
+    YOLO="${ISOCLAUDE_YOLO:-0}"
+    local args=() arg
+    for arg in "$@"; do
+        case "$arg" in
+            --yolo|-Y) YOLO=1 ;;
+            *)         args+=("$arg") ;;
+        esac
+    done
+    set -- "${args[@]}"
+
     case "${1:-}" in
         run)            shift; cmd_run "$@" ;;
         shell)          shift; cmd_shell "$@" ;;
