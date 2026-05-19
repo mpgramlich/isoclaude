@@ -129,12 +129,16 @@ and unchanged content reuses the cached image.
 
 ```dockerfile
 FROM isoclaude-base:latest
-USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip \
  && rm -rf /var/lib/apt/lists/*
-USER claude
 ```
+
+**Don't set `USER` in your project Dockerfile.** The base entrypoint
+needs to run as root briefly to remap UIDs to your host, then drops to
+the `claude` user via `gosu`. A `USER claude` line here would shift the
+entrypoint to non-root and break the remap with "usermod: Permission
+denied".
 
 ### `env`
 

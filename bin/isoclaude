@@ -440,12 +440,15 @@ cmd_init() {
 # Optional: extend the isoclaude base image with project-specific tools.
 # Uncomment, edit, and re-run `isoclaude build` to pick up changes.
 #
+# Don't set USER in this file — the base image's entrypoint runs briefly
+# as root to remap UIDs to match your host, then drops to the `claude`
+# user via gosu. A `USER claude` line here would shift the entrypoint to
+# non-root and break the remap with "usermod: Permission denied".
+#
 # FROM isoclaude-base:latest
-# USER root
 # RUN apt-get update && apt-get install -y --no-install-recommends \
 #         python3 python3-pip \
 #  && rm -rf /var/lib/apt/lists/*
-# USER claude
 EOF
 
     _scaffold "$dir/env" <<'EOF'
