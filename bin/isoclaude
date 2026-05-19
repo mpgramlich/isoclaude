@@ -50,10 +50,12 @@ detect_runtime() {
 }
 
 # Walk up from PWD looking for a .isoclaude/ directory. Stops at $HOME and /.
+# Ignores ISOCLAUDE_HOME itself (which is ~/.isoclaude by default) so the
+# user's global config dir isn't mistaken for a project root.
 project_root() {
     local dir="$PWD"
     while :; do
-        if [ -d "$dir/.isoclaude" ]; then
+        if [ -d "$dir/.isoclaude" ] && [ "$dir/.isoclaude" != "$ISOCLAUDE_HOME" ]; then
             printf '%s\n' "$dir"
             return
         fi
@@ -208,7 +210,7 @@ compose_run_flags() {
     else
         warn "$HOME/.claude.json not found; the in-container claude will need /login on first run"
     fi
-    _maybe_warn_macos_auth
+    _macos_auth_check
 
     # Git config (ro).
     if [ -f "$HOME/.gitconfig" ]; then
@@ -344,37 +346,82 @@ cmd_run() {
     fi
 }
 
-# On macOS, Claude Code's native installer stores OAuth credentials in the
-# login keychain instead of on disk. The Linux container can't reach the
-# keychain, so without bridging the user is "Not logged in" inside. This
-# warns when the situation is detected; `isoclaude sync-auth` fixes it.
-_maybe_warn_macos_auth() {
-    [ "$(uname 2>/dev/null)" = "Darwin" ] || return 0
-    [ -f "$HOME/.claude/.credentials.json" ] && return 0
-    command -v security >/dev/null 2>&1 || return 0
-    security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1 || return 0
-    warn "macOS keychain has claude credentials but ~/.claude/.credentials.json is missing"
-    warn "the in-container claude will report 'Not logged in'. To fix once:"
-    warn "  isoclaude sync-auth"
+# Bridge the macOS keychain credential into a file the container can read.
+# Silent when ~/.claude/.credentials.json already matches the keychain
+# (the common case after the first sync). Logs only on actual change.
+# Returns:
+#   0 — file is now in sync with keychain (either was already, or refreshed)
+#   1 — keychain has no claude credential AND no file exists
+#   2 — non-macOS / no security CLI (caller should silently skip)
+_macos_auth_refresh() {
+    [ "$(uname 2>/dev/null)" = "Darwin" ] || return 2
+    command -v security >/dev/null 2>&1   || return 2
+
+    local target="$HOME/.claude/.credentials.json" cur
+    cur=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) \
+        || cur=""
+
+    if [ -z "$cur" ]; then
+        # Keychain is empty. We leave any existing file alone (host might be
+        # logged out temporarily; better to keep stale auth than break the
+        # container outright). Caller decides whether to warn.
+        [ -f "$target" ] && return 0 || return 1
+    fi
+
+    if [ -f "$target" ] && [ "$(cat "$target")" = "$cur" ]; then
+        return 0  # already current; silent
+    fi
+
+    mkdir -p "$HOME/.claude"
+    # Write atomically: temp file + mv, so a concurrent read by the running
+    # host claude never sees a half-written file.
+    local tmp="$target.tmp.$$"
+    printf '%s\n' "$cur" > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$target"
+    log "refreshed ~/.claude/.credentials.json from macOS keychain"
+    return 0
+}
+
+# Called from compose_run_flags. Refreshes credentials when possible; warns
+# only when the user actually has nothing to authenticate with. The
+# `|| rc=$?` keeps the function under set -e from tripping when
+# _macos_auth_refresh's "no keychain on this platform" return (2) reaches
+# us — which is the normal path on Linux.
+_macos_auth_check() {
+    local rc=0
+    _macos_auth_refresh || rc=$?
+    case "$rc" in
+        1)  warn "no claude credentials found (host not logged in?)"
+            warn "  run host \`claude /login\`, then this will auto-sync"
+            ;;
+    esac
 }
 
 # Bridge the macOS keychain credential to a file the container can read.
+# Public, explicit version of _macos_auth_refresh — errors loudly when it
+# can't do anything.
 cmd_sync_auth() {
     [ "$(uname 2>/dev/null)" = "Darwin" ] \
         || die "sync-auth is only needed on macOS (other platforms store credentials on disk)"
     command -v security >/dev/null 2>&1 \
         || die "macOS \`security\` CLI not found"
-    mkdir -p "$HOME/.claude"
-    local target="$HOME/.claude/.credentials.json"
-    if security find-generic-password -s "Claude Code-credentials" -w \
-            > "$target" 2>/dev/null; then
-        chmod 600 "$target"
-        log "synced keychain credentials to $target"
-        log "the in-container claude should now read auth from this file"
-    else
-        rm -f "$target"
-        die "no 'Claude Code-credentials' entry in keychain; run host claude /login first"
-    fi
+
+    local rc=0
+    _macos_auth_refresh || rc=$?
+    case "$rc" in
+        0)
+            if [ -f "$HOME/.claude/.credentials.json" ]; then
+                log "credentials at ~/.claude/.credentials.json are in sync with keychain"
+            fi
+            ;;
+        1)
+            die "no 'Claude Code-credentials' entry in keychain; run host claude /login first"
+            ;;
+        2)
+            die "platform check failed (should not happen — file a bug)"
+            ;;
+    esac
 }
 
 cmd_shell() {
@@ -686,6 +733,164 @@ _self_path() {
     printf '%s\n' "$src"
 }
 
+# --- doctor ---
+
+_doc_ok()   { printf '  \033[32m[ok]\033[0m   %s\n' "$*"; DOC_OK=$((DOC_OK + 1)); }
+_doc_warn() { printf '  \033[33m[warn]\033[0m %s\n' "$*"; DOC_WARN=$((DOC_WARN + 1)); }
+_doc_err()  { printf '  \033[31m[err]\033[0m  %s\n' "$*"; DOC_ERR=$((DOC_ERR + 1)); }
+_doc_section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
+_doc_note()    { printf '         %s\n' "$1"; }
+
+_doctor_runtime() {
+    _doc_section "Runtime"
+    local runtime=""
+    if [ -n "${ISOCLAUDE_RUNTIME:-}" ]; then
+        if command -v "$ISOCLAUDE_RUNTIME" >/dev/null 2>&1; then
+            runtime="$ISOCLAUDE_RUNTIME"
+            _doc_ok "ISOCLAUDE_RUNTIME=$runtime (forced)"
+        else
+            _doc_err "ISOCLAUDE_RUNTIME=$ISOCLAUDE_RUNTIME but not on PATH"
+            return
+        fi
+    else
+        local r
+        for r in container orb docker podman; do
+            command -v "$r" >/dev/null 2>&1 && { runtime="$r"; break; }
+        done
+        if [ -n "$runtime" ]; then
+            _doc_ok "runtime detected: $runtime"
+        else
+            _doc_err "no container runtime on PATH (looked for: container, orb, docker, podman)"
+            return
+        fi
+    fi
+    if "$runtime" image list >/dev/null 2>&1; then
+        _doc_ok "runtime reachable (\`$runtime image list\` works)"
+    else
+        _doc_err "$runtime is on PATH but \`$runtime image list\` failed (daemon not running?)"
+    fi
+}
+
+_doctor_wrapper() {
+    _doc_section "Wrapper"
+    local self
+    self="$(_self_path)"
+    _doc_ok "wrapper at $self"
+    local dir
+    dir="$(dirname "$self")"
+    case ":$PATH:" in
+        *":$dir:"*) _doc_ok "wrapper dir on PATH" ;;
+        *) _doc_warn "wrapper dir ($dir) is not on PATH; you'd need to invoke by full path" ;;
+    esac
+}
+
+_doctor_pin_and_image() {
+    _doc_section "Pin & image"
+    if [ ! -f "$ISOCLAUDE_HOME/claude-version" ]; then
+        _doc_warn "no global pin at $ISOCLAUDE_HOME/claude-version (will query npm on first run)"
+        return
+    fi
+    local pin
+    pin="$(_read_trimmed "$ISOCLAUDE_HOME/claude-version")"
+    _doc_ok "global pin: $pin"
+
+    local runtime
+    runtime="$(detect_runtime 2>/dev/null || true)"
+    [ -z "$runtime" ] && return
+
+    local label
+    label="$(image_label_version "$runtime")"
+    if [ -z "$label" ]; then
+        _doc_warn "base image not built yet (~2 min build on next run)"
+    elif [ "$label" = "$pin" ]; then
+        _doc_ok "base image: $ISOCLAUDE_BASE_IMAGE @ $label"
+    else
+        _doc_warn "base image label ($label) differs from pin ($pin); next run will rebuild"
+    fi
+}
+
+_doctor_auth() {
+    _doc_section "Auth & mounts"
+    [ -d "$HOME/.claude" ]      && _doc_ok "~/.claude/ present"      || _doc_warn "~/.claude/ missing"
+    [ -f "$HOME/.claude.json" ] && _doc_ok "~/.claude.json present" || _doc_warn "~/.claude.json missing — in-container claude will need /login"
+
+    if [ "$(uname 2>/dev/null)" = "Darwin" ] && command -v security >/dev/null 2>&1; then
+        local has_kc has_file
+        has_kc=0; has_file=0
+        security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1 && has_kc=1
+        [ -f "$HOME/.claude/.credentials.json" ] && has_file=1
+
+        if [ "$has_kc" = 1 ] && [ "$has_file" = 1 ]; then
+            local kc_payload file_payload
+            kc_payload=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+            file_payload=$(cat "$HOME/.claude/.credentials.json")
+            if [ "$kc_payload" = "$file_payload" ]; then
+                _doc_ok "macOS keychain ↔ ~/.claude/.credentials.json in sync"
+            else
+                _doc_warn "macOS keychain has different credentials than ~/.claude/.credentials.json"
+                _doc_note "fix: run \`isoclaude sync-auth\` (or the next run will auto-refresh)"
+            fi
+        elif [ "$has_kc" = 1 ]; then
+            _doc_warn "macOS keychain has credentials but ~/.claude/.credentials.json missing"
+            _doc_note "fix: run \`isoclaude sync-auth\`"
+        elif [ "$has_file" = 1 ]; then
+            _doc_warn "~/.claude/.credentials.json exists but no keychain entry — host logged out?"
+        else
+            _doc_warn "no host login found (no keychain entry, no credentials file)"
+            _doc_note "fix: run host \`claude /login\`, then \`isoclaude sync-auth\`"
+        fi
+    elif [ -f "$HOME/.claude/.credentials.json" ]; then
+        _doc_ok "~/.claude/.credentials.json present"
+    else
+        _doc_warn "no claude credentials on disk; in-container claude will need /login"
+    fi
+
+    [ -f "$HOME/.gitconfig" ] && _doc_ok "~/.gitconfig present"      || _doc_warn "~/.gitconfig missing — commits in sandbox won't have your name/email"
+    [ -d "$HOME/.ssh"      ] && _doc_ok "~/.ssh/ present"            || _doc_warn "~/.ssh/ missing — no git push over ssh from sandbox"
+}
+
+_doctor_project() {
+    _doc_section "Project"
+    local proj
+    proj="$(project_root)"
+    if [ -z "$proj" ]; then
+        _doc_note "no .isoclaude/ found at or above $PWD (using base image, no overlays)"
+        return
+    fi
+    _doc_ok "project root: $proj"
+
+    if [ -f "$proj/.isoclaude/claude-version" ]; then
+        _doc_ok "project pin: $(_read_trimmed "$proj/.isoclaude/claude-version")"
+    fi
+    [ -f "$proj/.isoclaude/env"    ] && _doc_ok ".isoclaude/env present"
+    [ -f "$proj/.isoclaude/mounts" ] && _doc_ok ".isoclaude/mounts present"
+
+    if [ -f "$proj/.isoclaude/Dockerfile" ] \
+            && grep -qE '^FROM[[:space:]]' "$proj/.isoclaude/Dockerfile"; then
+        local runtime hash img
+        runtime="$(detect_runtime 2>/dev/null || true)"
+        hash="$(_file_hash "$proj/.isoclaude/Dockerfile")"
+        img="isoclaude-project-${hash}:latest"
+        if [ -n "$runtime" ] && "$runtime" image inspect "$img" >/dev/null 2>&1; then
+            _doc_ok "project image: $img (built)"
+        else
+            _doc_warn "project image $img not built yet (next run will build)"
+        fi
+    fi
+}
+
+cmd_doctor() {
+    DOC_OK=0; DOC_WARN=0; DOC_ERR=0
+    _doctor_runtime
+    _doctor_wrapper
+    _doctor_pin_and_image
+    _doctor_auth
+    _doctor_project
+
+    printf '\n%d ok, %d warn, %d error\n' "$DOC_OK" "$DOC_WARN" "$DOC_ERR"
+    [ "$DOC_ERR" -eq 0 ]
+}
+
 cmd_help() {
     cat <<'EOF'
 isoclaude — run Claude Code in a sandboxed container.
@@ -715,7 +920,10 @@ SUBCOMMANDS
     sync-auth               macOS only. Copy Claude Code's keychain
                             credentials to ~/.claude/.credentials.json so
                             the in-container claude can authenticate.
-                            Run once after each host /login.
+                            (Each isoclaude run also auto-refreshes
+                            silently when the keychain content changes.)
+    doctor                  Diagnose runtime, image, auth, and project
+                            state. Exits 0 if no errors.
     uninstall [--purge]     Remove the wrapper and ~/.isoclaude/. With
               [--yes|-y]    --purge, also removes all isoclaude images.
                             Prompts for confirmation unless --yes.
@@ -762,6 +970,7 @@ main() {
         pin)            shift; cmd_pin "$@" ;;
         prune)          shift; cmd_prune "$@" ;;
         sync-auth)      shift; cmd_sync_auth "$@" ;;
+        doctor)         shift; cmd_doctor "$@" ;;
         uninstall)      shift; cmd_uninstall "$@" ;;
         help|-h|--help) cmd_help ;;
         --)             shift; cmd_run "$@" ;;

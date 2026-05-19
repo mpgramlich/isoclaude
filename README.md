@@ -87,7 +87,8 @@ nothing has changed.
 | `isoclaude update --check` | Compare global pin to npm latest |
 | `isoclaude pin [VER]` | Set per-project pin and rebuild |
 | `isoclaude prune [--all]` | Remove built project images |
-| `isoclaude sync-auth` | macOS only — copy Claude Code's keychain credentials to `~/.claude/.credentials.json` so the in-container claude can authenticate. Run once after each host `/login`. |
+| `isoclaude doctor` | Diagnose runtime, image, auth, and project state. Exits 0 if no errors. |
+| `isoclaude sync-auth` | macOS only — copy Claude Code's keychain credentials to `~/.claude/.credentials.json` so the in-container claude can authenticate. Each `run` and `shell` invocation also auto-refreshes silently when the keychain changes; you only need to call `sync-auth` explicitly to verify status. |
 | `isoclaude uninstall [--purge]` | Remove the wrapper and config |
 | `isoclaude help` | Show usage |
 

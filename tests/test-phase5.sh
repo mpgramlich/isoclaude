@@ -375,24 +375,221 @@ else
     ok "sync-auth refuses on non-macOS"
 fi
 
-# _maybe_warn_macos_auth: on Darwin + keychain cred + missing file, prints warning.
+# _macos_auth_refresh: Darwin + keychain cred + missing file → silent refresh.
 rm -f "$HOME/.claude/.credentials.json"
-out=$(FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED=1 _maybe_warn_macos_auth 2>&1)
+out=$(FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED=1 _macos_auth_refresh 2>&1)
 case "$out" in
-    *"keychain has claude credentials"*"isoclaude sync-auth"*)
-        ok "_maybe_warn_macos_auth points the user at sync-auth" ;;
-    *) bad "warning text" "got: $out" ;;
+    *"refreshed ~/.claude/.credentials.json"*)
+        ok "_macos_auth_refresh creates the file when missing" ;;
+    *) bad "missing-file path" "got: $out" ;;
+esac
+[ -f "$HOME/.claude/.credentials.json" ] \
+    && ok "_macos_auth_refresh actually wrote the file" \
+    || bad "no file after refresh"
+
+# When the file already matches the keychain payload, refresh is silent.
+out=$(FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED=1 _macos_auth_refresh 2>&1)
+[ -z "$out" ] && ok "silent when file is already current" \
+    || bad "spurious refresh log" "got: $out"
+
+# When the file has stale contents, refresh updates and logs.
+echo 'stale-content' > "$HOME/.claude/.credentials.json"
+out=$(FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED=1 _macos_auth_refresh 2>&1)
+case "$out" in
+    *"refreshed"*) ok "refresh updates a stale file" ;;
+    *) bad "no refresh log on stale file" "got: $out" ;;
+esac
+grep -q 'claudeAiOauth' "$HOME/.claude/.credentials.json" \
+    && ok "stale file is now in sync with keychain" \
+    || bad "file still stale after refresh"
+
+# Keychain empty + existing file → leave the file alone (don't blow away stale auth).
+out=$(FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED="" _macos_auth_refresh; echo "rc=$?")
+case "$out" in
+    *rc=0*) ok "rc=0 when file exists despite empty keychain (caller can keep using it)" ;;
+    *) bad "rc on empty-keychain-with-file" "got: $out" ;;
+esac
+[ -f "$HOME/.claude/.credentials.json" ] \
+    && ok "preserves existing file when keychain is empty" \
+    || bad "file was deleted"
+
+# Keychain empty + no file → return 1 so caller can warn.
+# (`rc=0; (sub) || rc=$?` captures the subshell's nonzero exit without
+# tripping set -e in the parent.)
+rm -f "$HOME/.claude/.credentials.json"
+rc=0; ( FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED="" _macos_auth_refresh ) || rc=$?
+[ "$rc" -eq 1 ] && ok "returns 1 when keychain empty AND no file" || bad "wrong rc: $rc"
+
+# Non-macOS → rc=2, no warning, no file changes.
+rc=0; ( FAKE_UNAME="Linux" _macos_auth_refresh ) || rc=$?
+[ "$rc" -eq 2 ] && ok "returns 2 on non-macOS (caller silently skips)" || bad "wrong rc: $rc"
+
+#-----------------------------------------------------------------------
+section "isoclaude doctor"
+
+# Reset to a known-good state for doctor checks.
+rm -rf "$ISOCLAUDE_HOME"; mkdir -p "$ISOCLAUDE_HOME"
+cp "$REPO/image/Dockerfile.base" "$ISOCLAUDE_HOME/Dockerfile.base"
+cp "$REPO/image/entrypoint.sh"   "$ISOCLAUDE_HOME/entrypoint.sh"
+echo "1.2.3" > "$ISOCLAUDE_HOME/claude-version"
+echo '{}' > "$HOME/.claude.json"
+echo "[user]" > "$HOME/.gitconfig"
+mkdir -p "$HOME/.ssh"; echo "k" > "$HOME/.ssh/id_ed25519"
+rm -f "$HOME/.claude/.credentials.json"
+
+# Helper: run doctor with the fake runtime + fake security/uname; capture
+# stdout and exit code separately.
+run_doctor() {
+    out=""; rc=0
+    out=$("$WRAPPER" doctor 2>&1) || rc=$?
+}
+
+#--- Happy path: all the bits the harness controls are healthy.
+FAKE_LABEL="1.2.3" FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED=1 \
+    run_doctor
+case "$out" in
+    *"Runtime"*"Wrapper"*"Pin & image"*"Auth"*"Project"*) ok "doctor prints all 5 sections in order" ;;
+    *) bad "section order" "got: $out" ;;
+esac
+[ "$rc" -eq 0 ] && ok "exits 0 on healthy state" || bad "rc=$rc on healthy"
+case "$out" in
+    *"ISOCLAUDE_RUNTIME=docker"*|*"runtime detected: docker"*) ok "reports the runtime" ;;
+    *) bad "no runtime line" "got: $out" ;;
+esac
+case "$out" in
+    *"global pin: 1.2.3"*) ok "reports global pin" ;;
+    *) bad "no pin line" ;;
+esac
+case "$out" in
+    *"base image: $ISOCLAUDE_BASE_IMAGE @ 1.2.3"*) ok "reports image label match" ;;
+    *) bad "no image-label line" ;;
+esac
+case "$out" in
+    *"keychain ↔ ~/.claude/.credentials.json in sync"*) ok "reports keychain in sync (auto-refreshed by doctor itself? no — _macos_auth_refresh is gated on container launch)" ;;
+    *"~/.claude/.credentials.json"*) ok "auth section mentions credentials file state" ;;
+    *) bad "no credentials line" "got: $out" ;;
+esac
+case "$out" in
+    *"no .isoclaude/ found"*) ok "reports no project when none present" ;;
+    *) bad "project section" "got: $out" ;;
 esac
 
-# When the file already exists, no warning.
-echo '{}' > "$HOME/.claude/.credentials.json"
-out=$(FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED=1 _maybe_warn_macos_auth 2>&1)
-[ -z "$out" ] && ok "no warning when credentials file already present" \
-    || bad "spurious warning" "got: $out"
+#--- Image label mismatch (pin moved, image hasn't been rebuilt yet)
+FAKE_LABEL="0.0.1" FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED=1 \
+    run_doctor
+case "$out" in
+    *"label (0.0.1) differs from pin (1.2.3)"*"next run will rebuild"*) ok "warns on label/pin drift" ;;
+    *) bad "drift warning" "got: $out" ;;
+esac
+[ "$rc" -eq 0 ] && ok "drift is a warn, not an error (rc=0)" || bad "drift triggered rc=$rc"
 
-# When not on macOS, no warning regardless of keychain state.
-out=$(FAKE_UNAME="Linux" FAKE_KEYCHAIN_HAS_CRED=1 _maybe_warn_macos_auth 2>&1)
-[ -z "$out" ] && ok "no warning on non-macOS" || bad "Linux warning: $out"
+#--- Daemon not reachable (fake docker fails image list)
+cat > "$TMP/fakebin/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    image)
+        if [ "$2" = "list" ] || [ "$2" = "ls" ]; then
+            echo "Cannot connect" >&2
+            exit 1
+        fi
+        if [ "$2" = "inspect" ]; then exit 1; fi
+        ;;
+esac
+exit 0
+EOF
+chmod +x "$TMP/fakebin/docker"
+run_doctor
+case "$out" in
+    *"image list\` failed"*) ok "errors when runtime daemon is down" ;;
+    *) bad "no daemon error" "got: $out" ;;
+esac
+[ "$rc" -eq 1 ] && ok "exits 1 on runtime error" || bad "rc=$rc on runtime error"
+
+# Restore the working fake docker for the remaining tests.
+cat > "$TMP/fakebin/docker" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >> "$FAKE_DOCKER_LOG"
+case "$1" in
+    image)
+        case "$2" in
+            list|ls) printf 'REPO\tTAG\tID\tCREATED\tSIZE\n'; exit 0 ;;
+            inspect)
+                target="$3"
+                if [ -n "${FAKE_LABEL:-}" ] && [ "$target" = "isoclaude-base:latest" ]; then
+                    printf '[{"Config":{"Labels":{"isoclaude.claude_version":"%s"}}}]\n' "$FAKE_LABEL"
+                    exit 0
+                fi
+                exit 1
+                ;;
+        esac
+        ;;
+esac
+exit 0
+EOF
+chmod +x "$TMP/fakebin/docker"
+
+#--- No pin set at all
+rm -f "$ISOCLAUDE_HOME/claude-version"
+FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED=1 run_doctor
+case "$out" in
+    *"no global pin"*) ok "warns when no global pin set" ;;
+    *) bad "no-pin warning" "got: $out" ;;
+esac
+[ "$rc" -eq 0 ] && ok "missing pin is warn, not error" || bad "rc=$rc on missing pin"
+
+#--- Image not built yet
+echo "1.2.3" > "$ISOCLAUDE_HOME/claude-version"
+unset FAKE_LABEL
+FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED=1 run_doctor
+case "$out" in
+    *"base image not built yet"*) ok "warns when base image missing" ;;
+    *) bad "no unbuilt-image warning" ;;
+esac
+
+#--- macOS, keychain empty, no credentials file
+FAKE_LABEL="1.2.3" FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED="" \
+    rm -f "$HOME/.claude/.credentials.json"
+FAKE_LABEL="1.2.3" FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED="" run_doctor
+case "$out" in
+    *"no host login found"*"run host"*claude*login*) ok "auth section points at host /login when nothing is configured" ;;
+    *) bad "no-login guidance" "got: $out" ;;
+esac
+
+#--- macOS, keychain has cred, file is stale
+echo 'stale' > "$HOME/.claude/.credentials.json"
+FAKE_LABEL="1.2.3" FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED=1 run_doctor
+case "$out" in
+    *"different credentials"*"sync-auth"*) ok "warns on stale credentials file" ;;
+    *) bad "no stale-cred warning" "got: $out" ;;
+esac
+
+#--- macOS, keychain has cred, file is in sync
+rm -f "$HOME/.claude/.credentials.json"
+FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED=1 _macos_auth_refresh >/dev/null 2>&1
+FAKE_LABEL="1.2.3" FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED=1 run_doctor
+case "$out" in
+    *"in sync"*) ok "reports sync OK when keychain and file match" ;;
+    *) bad "sync-ok line missing" "got: $out" ;;
+esac
+
+#--- Project: with a project root, env file, project Dockerfile
+mkdir -p "$TMP/proj/.isoclaude"
+echo "9.9.9" > "$TMP/proj/.isoclaude/claude-version"
+echo "FOO=bar" > "$TMP/proj/.isoclaude/env"
+cat > "$TMP/proj/.isoclaude/Dockerfile" <<'EOF'
+FROM isoclaude-base:latest
+RUN echo proj
+EOF
+( cd "$TMP/proj" && FAKE_LABEL="1.2.3" FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED=1 \
+    out=$("$WRAPPER" doctor 2>&1); echo "$out" ) > "$TMP/proj.doctor"
+case "$(cat "$TMP/proj.doctor")" in
+    *"project root: $TMP/proj"*"project pin: 9.9.9"*".isoclaude/env present"*) ok "project section lists root, pin, and env" ;;
+    *) bad "project section" "got: $(cat "$TMP/proj.doctor")" ;;
+esac
+case "$(cat "$TMP/proj.doctor")" in
+    *"project image isoclaude-project-"*"not built"*) ok "project section reports unbuilt project image" ;;
+    *) bad "project image line missing" ;;
+esac
 
 #-----------------------------------------------------------------------
 printf '\n\033[1mPhase 5: %d passed, %d failed\033[0m\n' "$pass" "$fail"

@@ -129,6 +129,14 @@ mkdir -p "$TMP/proj/.isoclaude"
     && ok "finds .isoclaude/ in current dir" \
     || bad "current-dir case"
 
+# Regression: ISOCLAUDE_HOME=$HOME/.isoclaude is the wrapper's own config dir,
+# NOT a project root. Walking up from a child shouldn't find $HOME as project.
+mkdir -p "$HOME/.isoclaude"   # simulate the wrapper's global config dir
+mkdir -p "$HOME/child"
+( cd "$HOME/child" && [ -z "$(project_root)" ] ) \
+    && ok "skips ISOCLAUDE_HOME (~/.isoclaude) as a project root" \
+    || bad "returned global config dir as a project: $(cd "$HOME/child" && project_root)"
+
 #-----------------------------------------------------------------------
 section "ensure_iso_home (dev-mode seeding)"
 
