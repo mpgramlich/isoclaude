@@ -137,6 +137,12 @@ mkdir -p "$HOME/child"
     && ok "skips ISOCLAUDE_HOME (~/.isoclaude) as a project root" \
     || bad "returned global config dir as a project: $(cd "$HOME/child" && project_root)"
 
+# Regression: when ISOCLAUDE_HOME is overridden, $HOME/.isoclaude no longer
+# matches the override but should STILL not be reported as a project root.
+( cd "$HOME/child" && ISOCLAUDE_HOME=/tmp/elsewhere [ -z "$(project_root)" ] ) \
+    && ok "still skips \$HOME as project root with ISOCLAUDE_HOME overridden" \
+    || bad "$HOME leaked as project when ISOCLAUDE_HOME is custom: $(cd "$HOME/child" && ISOCLAUDE_HOME=/tmp/elsewhere project_root)"
+
 #-----------------------------------------------------------------------
 section "ensure_iso_home (dev-mode seeding)"
 

@@ -50,16 +50,22 @@ detect_runtime() {
 }
 
 # Walk up from PWD looking for a .isoclaude/ directory. Stops at $HOME and /.
-# Ignores ISOCLAUDE_HOME itself (which is ~/.isoclaude by default) so the
-# user's global config dir isn't mistaken for a project root.
+# Treats $HOME itself as off-limits: $HOME/.isoclaude is reserved for the
+# wrapper's global config dir (the default ISOCLAUDE_HOME). When the user
+# overrides ISOCLAUDE_HOME to a different path, $HOME/.isoclaude might no
+# longer match — but we still don't want to surface it as a "project" since
+# that's never what the user means.
 project_root() {
     local dir="$PWD"
     while :; do
+        if [ "$dir" = "$HOME" ]; then
+            return  # $HOME is reserved, not a project root
+        fi
         if [ -d "$dir/.isoclaude" ] && [ "$dir/.isoclaude" != "$ISOCLAUDE_HOME" ]; then
             printf '%s\n' "$dir"
             return
         fi
-        if [ "$dir" = "/" ] || [ "$dir" = "$HOME" ]; then
+        if [ "$dir" = "/" ]; then
             return
         fi
         dir="$(dirname "$dir")"
