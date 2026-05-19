@@ -308,6 +308,13 @@ _add_project_mounts() {
             "~")    host="$HOME" ;;
             "~/"*)  host="$HOME/${host#\~/}" ;;
         esac
+        # Pre-check: runtime errors with a cryptic message if the host
+        # path doesn't exist. Warn loudly and skip — silently dropping a
+        # mount the user asked for would hide a real problem.
+        if [ ! -e "$host" ]; then
+            warn "$file: host path doesn't exist, skipping: $line"
+            continue
+        fi
         _add_mount "$host:$rest"
     done < "$file"
 }

@@ -148,18 +148,22 @@ esac
 section "mounts file: parsing + ~ expansion"
 
 reset_proj
+# Pre-create the host paths the test references — the wrapper now refuses
+# mounts whose host path doesn't exist (Apple container would otherwise
+# error with a cryptic "path does not exist" message).
+mkdir -p "$TMP/host-tmp-foo" "$HOME/scratch" "$TMP/host-abs"
 cat > "$TMP/proj/.isoclaude/mounts" <<EOF
 # A comment line that should be ignored.
 
-/tmp/foo:/work/foo
+$TMP/host-tmp-foo:/work/foo
 ~/scratch:/scratch:ro
    # leading-space comment
-/abs:/dst
+$TMP/host-abs:/dst
 EOF
 compose_run_flags
 flags="${RUN_FLAGS[*]}"
 case "$flags" in
-    *"-v /tmp/foo:/work/foo"*)            ok "mounts absolute host path"        ;;
+    *"-v $TMP/host-tmp-foo:/work/foo"*)   ok "mounts absolute host path"        ;;
     *) bad "absolute mount missing" "flags: $flags" ;;
 esac
 case "$flags" in
@@ -167,13 +171,28 @@ case "$flags" in
     *) bad "~ expansion failed" "flags: $flags" ;;
 esac
 case "$flags" in
-    *"-v /abs:/dst"*)                     ok "handles multiple mounts"          ;;
+    *"-v $TMP/host-abs:/dst"*)            ok "handles multiple mounts"          ;;
     *) bad "second absolute mount missing" "flags: $flags" ;;
 esac
 # Comments shouldn't appear as flags.
 case "$flags" in
     *"-v # "*|*"# A comment"*) bad "comment leaked into mount flags" ;;
     *) ok "skips comment lines and blanks" ;;
+esac
+
+# Mount with a host path that doesn't exist → warn and skip (instead of
+# letting the runtime error out with a cryptic message).
+echo "/nonexistent-host-path/oops:/inside:ro" > "$TMP/proj/.isoclaude/mounts"
+compose_run_flags 2>"$TMP/cf.err"
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    *nonexistent-host-path*) bad "missing host path leaked into flags" ;;
+    *) ok "skips mount when host path is absent" ;;
+esac
+out=$(cat "$TMP/cf.err")
+case "$out" in
+    *"host path doesn't exist"*nonexistent*) ok "warns when skipping missing-host-path mount" ;;
+    *) bad "no warning" "got: $out" ;;
 esac
 
 # Invalid mount line (no colon) → warn, skip.
@@ -191,13 +210,14 @@ esac
 
 # local/mounts also read.
 rm "$TMP/proj/.isoclaude/mounts"
+mkdir -p "$TMP/host-local-only"
 cat > "$TMP/proj/.isoclaude/local/mounts" <<EOF
-/tmp/local-only:/local-only:ro
+$TMP/host-local-only:/local-only:ro
 EOF
 compose_run_flags
 flags="${RUN_FLAGS[*]}"
 case "$flags" in
-    *"-v /tmp/local-only:/local-only:ro"*) ok "reads local/mounts" ;;
+    *"-v $TMP/host-local-only:/local-only:ro"*) ok "reads local/mounts" ;;
     *) bad "local/mounts not read" "flags: $flags" ;;
 esac
 
@@ -280,9 +300,10 @@ esac
 section "End-to-end: all four overlays integrated"
 
 reset_proj
+mkdir -p "$TMP/host-data" "$HOME/.cache/foo"
 echo 'PROJ_VAR=set' > "$TMP/proj/.isoclaude/env"
 echo 'LOCAL_VAR=set' > "$TMP/proj/.isoclaude/local/env"
-echo '/tmp/data:/data:ro' > "$TMP/proj/.isoclaude/mounts"
+echo "$TMP/host-data:/data:ro" > "$TMP/proj/.isoclaude/mounts"
 echo '~/.cache/foo:/home/claude/.cache/foo' > "$TMP/proj/.isoclaude/local/mounts"
 cat > "$TMP/proj/.isoclaude/Dockerfile" <<'EOF'
 FROM isoclaude-base:latest
@@ -305,8 +326,8 @@ case "$out" in
     *) bad "env -e flags missing or out of order" "got: $out" ;;
 esac
 case "$out" in
-    *-v\ /tmp/data:/data:ro*) ok "committed mount in run command" ;;
-    *) bad "mount missing" ;;
+    *-v\ "$TMP"/host-data:/data:ro*) ok "committed mount in run command" ;;
+    *) bad "mount missing" "got: $out" ;;
 esac
 case "$out" in
     *-v\ $HOME/.cache/foo:/home/claude/.cache/foo*) ok "local mount with ~ expansion in run command" ;;
