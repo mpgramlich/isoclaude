@@ -206,6 +206,12 @@ compose_run_flags() {
     if [ "$PWD" = "/" ]; then
         die "isoclaude refuses to run with PWD=/ (would overlay the container's rootfs); cd to a subdirectory first"
     fi
+    # Refuse PWD containing ':' — it's the separator in `-v src:dst` so
+    # the runtime would misparse the bind spec. (A future move to docker's
+    # --mount type=bind,source=...,target=... syntax would lift this.)
+    case "$PWD" in
+        *:*) die "isoclaude doesn't support a working directory whose path contains ':' (would break -v src:dst parsing)" ;;
+    esac
     _add_mount "$PWD:$PWD"
     _add "-w" "$PWD"
 

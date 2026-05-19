@@ -274,6 +274,13 @@ case "$out" in
     *"refuses to run with PWD=/"*) ok "refuses PWD=/ with a clear error" ;;
     *) bad "no PWD=/ guard" "got: $out" ;;
 esac
+
+# PWD containing ':' would break the `-v src:dst` parser. Refuse early.
+out=$( ( cd "$TMP/proj" && PWD="/tmp/a:b" && compose_run_flags ) 2>&1 || true )
+case "$out" in
+    *"path contains ':'"*) ok "refuses PWD with ':' (would mis-parse as -v src:dst)" ;;
+    *) bad "no colon-in-PWD guard" "got: $out" ;;
+esac
 case "$flags" in
     *"-v $HOME/.claude:/home/claude/.claude"*) ok "mounts ~/.claude rw" ;;
     *) bad "missing ~/.claude mount" "flags: $flags" ;;
