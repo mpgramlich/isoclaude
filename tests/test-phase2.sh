@@ -290,7 +290,7 @@ esac
 
 # Missing host files → wrapper should warn, not crash.
 rm -f "$HOME/.gitconfig" "$HOME/.claude.json"
-rm -rf "$HOME/.ssh"
+rm -rf "$HOME/.ssh" "$HOME/.claude"
 compose_run_flags 2>/dev/null
 flags="${RUN_FLAGS[*]}"
 case "$flags" in
@@ -304,6 +304,14 @@ esac
 case "$flags" in
     *".claude.json"*) bad "should skip missing ~/.claude.json" ;;
     *) ok "skips ~/.claude.json mount when host file missing" ;;
+esac
+# ~/.claude should be auto-created if missing so the bind mount works on
+# runtimes that don't auto-create the source (e.g. Apple container).
+[ -d "$HOME/.claude" ] && ok "creates ~/.claude on demand when missing" \
+    || bad "should have created ~/.claude"
+case "$flags" in
+    *"-v $HOME/.claude:/home/claude/.claude"*) ok "still mounts ~/.claude after creating it" ;;
+    *) bad "mount missing after auto-create" "flags: $flags" ;;
 esac
 mkdir -p "$HOME/.ssh"; echo k > "$HOME/.ssh/id_ed25519"
 echo "[user]" > "$HOME/.gitconfig"

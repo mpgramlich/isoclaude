@@ -208,7 +208,16 @@ compose_run_flags() {
     #                                    on macOS installs after sync-auth.
     # macOS native installs keep credentials in the keychain instead; see
     # _maybe_warn_macos_auth below.
-    _add_mount "$HOME/.claude:/home/claude/.claude"
+    # Create ~/.claude on demand. Without it the bind mount fails on
+    # runtimes that don't auto-create the source ("path does not exist"
+    # on Apple container), and the in-container claude has no place to
+    # save session state. Idempotent if the dir already exists.
+    mkdir -p "$HOME/.claude" 2>/dev/null || true
+    if [ -d "$HOME/.claude" ]; then
+        _add_mount "$HOME/.claude:/home/claude/.claude"
+    else
+        warn "$HOME/.claude could not be created; session state won't persist"
+    fi
     if [ -f "$HOME/.claude.json" ]; then
         _add_mount "$HOME/.claude.json:/home/claude/.claude.json"
     else
@@ -981,15 +990,19 @@ EOF
 
 main() {
     # Scan for global flags (currently just --yolo / -Y), strip them, and
-    # remember in YOLO. Order-independent: works whether the flag comes
-    # before a subcommand, after it, or stands alone.
+    # remember in YOLO. Order-independent up to `--`: once we see the
+    # separator, everything after is preserved as a literal arg (so users
+    # can pass a literal `--yolo` to claude if they really need to).
     YOLO="${ISOCLAUDE_YOLO:-0}"
-    local args=() arg
+    local args=() arg seen_dashdash=0
     for arg in "$@"; do
-        case "$arg" in
-            --yolo|-Y) YOLO=1 ;;
-            *)         args+=("$arg") ;;
-        esac
+        if [ "$seen_dashdash" = 0 ]; then
+            case "$arg" in
+                --yolo|-Y) YOLO=1; continue ;;
+                --)        seen_dashdash=1 ;;  # fall through, preserve --
+            esac
+        fi
+        args+=("$arg")
     done
     set -- "${args[@]}"
 

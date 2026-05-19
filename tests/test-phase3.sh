@@ -372,6 +372,21 @@ case "$out" in
     *) bad "shell+yolo" "got: $out" ;;
 esac
 
+# `--yolo` after `--` is a literal claude arg, NOT consumed by the wrapper.
+out=$(cd "$TMP/proj" && RUN_WRAPPER -- --yolo 2>&1 | tail -1)
+case "$out" in
+    *"--dangerously-skip-permissions"*) bad "--yolo after -- was still consumed" ;;
+    *claude*--yolo*) ok "--yolo after -- passes through as a literal claude arg" ;;
+    *) bad "-- + --yolo routing" "got: $out" ;;
+esac
+
+# `--yolo before --` still works.
+out=$(cd "$TMP/proj" && RUN_WRAPPER --yolo -- --some-flag 2>&1 | tail -1)
+case "$out" in
+    *"--dangerously-skip-permissions --some-flag") ok "--yolo before -- still works; -- passes the rest" ;;
+    *) bad "--yolo + -- before flag" "got: $out" ;;
+esac
+
 # --yolo with `init` is a no-op (init doesn't launch a container).
 out=$(cd "$TMP/proj/sub" 2>/dev/null || cd "$TMP/proj"; RUN_WRAPPER --yolo init 2>&1; echo "exit:$?")
 case "$out" in
