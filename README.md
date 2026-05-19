@@ -87,6 +87,7 @@ nothing has changed.
 | `isoclaude update --check` | Compare global pin to npm latest |
 | `isoclaude pin [VER]` | Set per-project pin and rebuild |
 | `isoclaude prune [--all]` | Remove built project images |
+| `isoclaude sync-auth` | macOS only — copy Claude Code's keychain credentials to `~/.claude/.credentials.json` so the in-container claude can authenticate. Run once after each host `/login`. |
 | `isoclaude uninstall [--purge]` | Remove the wrapper and config |
 | `isoclaude help` | Show usage |
 
@@ -205,6 +206,13 @@ invocations reuse the cached image until your pin changes.
 **Auth doesn't persist** — the wrapper mounts `~/.claude` rw, so a login
 inside the container writes to the same dir as your host. If this stops
 working, check that `~/.claude` is owned by your host user and not root.
+
+**"Not logged in" on macOS even though host claude is logged in** — the
+macOS native installer keeps OAuth credentials in the keychain, which the
+Linux container can't reach. Run `isoclaude sync-auth` once (and again
+after each host `/login`) to bridge the keychain into
+`~/.claude/.credentials.json`, which the container can read. `install.sh`
+does this automatically on macOS post-install.
 
 ## Uninstalling
 

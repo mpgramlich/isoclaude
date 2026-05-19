@@ -195,8 +195,20 @@ compose_run_flags() {
     _add_mount "$PWD:$PWD"
     _add "-w" "$PWD"
 
-    # Auth/credentials (rw so login persists).
+    # Auth/credentials (rw so login persists). Claude stores all of:
+    #   ~/.claude/                       session history, projects, backups
+    #   ~/.claude.json                   the actual config (incl. settings)
+    #   ~/.claude/.credentials.json      OAuth tokens, on Linux installs and
+    #                                    on macOS installs after sync-auth.
+    # macOS native installs keep credentials in the keychain instead; see
+    # _maybe_warn_macos_auth below.
     _add_mount "$HOME/.claude:/home/claude/.claude"
+    if [ -f "$HOME/.claude.json" ]; then
+        _add_mount "$HOME/.claude.json:/home/claude/.claude.json"
+    else
+        warn "$HOME/.claude.json not found; the in-container claude will need /login on first run"
+    fi
+    _maybe_warn_macos_auth
 
     # Git config (ro).
     if [ -f "$HOME/.gitconfig" ]; then
@@ -329,6 +341,39 @@ cmd_run() {
         _exec_in_sandbox "$RUNTIME" claude --dangerously-skip-permissions "$@"
     else
         _exec_in_sandbox "$RUNTIME" claude "$@"
+    fi
+}
+
+# On macOS, Claude Code's native installer stores OAuth credentials in the
+# login keychain instead of on disk. The Linux container can't reach the
+# keychain, so without bridging the user is "Not logged in" inside. This
+# warns when the situation is detected; `isoclaude sync-auth` fixes it.
+_maybe_warn_macos_auth() {
+    [ "$(uname 2>/dev/null)" = "Darwin" ] || return 0
+    [ -f "$HOME/.claude/.credentials.json" ] && return 0
+    command -v security >/dev/null 2>&1 || return 0
+    security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1 || return 0
+    warn "macOS keychain has claude credentials but ~/.claude/.credentials.json is missing"
+    warn "the in-container claude will report 'Not logged in'. To fix once:"
+    warn "  isoclaude sync-auth"
+}
+
+# Bridge the macOS keychain credential to a file the container can read.
+cmd_sync_auth() {
+    [ "$(uname 2>/dev/null)" = "Darwin" ] \
+        || die "sync-auth is only needed on macOS (other platforms store credentials on disk)"
+    command -v security >/dev/null 2>&1 \
+        || die "macOS \`security\` CLI not found"
+    mkdir -p "$HOME/.claude"
+    local target="$HOME/.claude/.credentials.json"
+    if security find-generic-password -s "Claude Code-credentials" -w \
+            > "$target" 2>/dev/null; then
+        chmod 600 "$target"
+        log "synced keychain credentials to $target"
+        log "the in-container claude should now read auth from this file"
+    else
+        rm -f "$target"
+        die "no 'Claude Code-credentials' entry in keychain; run host claude /login first"
     fi
 }
 
@@ -667,6 +712,10 @@ SUBCOMMANDS
                             current global pin) and rebuild.
     prune [--all]           Remove built project images. Without --all,
                             keeps the current project's active image.
+    sync-auth               macOS only. Copy Claude Code's keychain
+                            credentials to ~/.claude/.credentials.json so
+                            the in-container claude can authenticate.
+                            Run once after each host /login.
     uninstall [--purge]     Remove the wrapper and ~/.isoclaude/. With
               [--yes|-y]    --purge, also removes all isoclaude images.
                             Prompts for confirmation unless --yes.
@@ -712,6 +761,7 @@ main() {
         update)         shift; cmd_update "$@" ;;
         pin)            shift; cmd_pin "$@" ;;
         prune)          shift; cmd_prune "$@" ;;
+        sync-auth)      shift; cmd_sync_auth "$@" ;;
         uninstall)      shift; cmd_uninstall "$@" ;;
         help|-h|--help) cmd_help ;;
         --)             shift; cmd_run "$@" ;;

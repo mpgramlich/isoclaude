@@ -127,6 +127,17 @@ if [ "$NO_BUILD" -eq 0 ] && [ -n "$RUNTIME" ]; then
     "$DEST" build || warn "pre-build failed; first \`isoclaude\` invocation will retry"
 fi
 
+# On macOS, bridge keychain credentials into ~/.claude/.credentials.json so
+# the in-container claude can authenticate. Skip silently if the keychain
+# has no claude credential (user just hasn't logged in yet).
+if [ "$(uname 2>/dev/null)" = "Darwin" ] \
+        && command -v security >/dev/null 2>&1 \
+        && ! [ -f "$HOME/.claude/.credentials.json" ] \
+        && security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1; then
+    log "syncing macOS keychain credentials for the sandboxed claude"
+    "$DEST" sync-auth || warn "sync-auth failed; you can run it manually later"
+fi
+
 # Final hint.
 case ":$PATH:" in
     *":$PREFIX:"*)

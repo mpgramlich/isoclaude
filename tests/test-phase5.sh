@@ -295,5 +295,105 @@ esac
 [ -f "$SELF3" ] && ok "wrapper preserved after cancellation" || bad "wrapper removed despite cancel"
 
 #-----------------------------------------------------------------------
+section "isoclaude sync-auth (macOS keychain bridge)"
+
+# Mock the macOS `security` CLI: success returns the canned credential.
+cat > "$TMP/fakebin/security" <<'EOF'
+#!/usr/bin/env bash
+# Only the `find-generic-password -s "Claude Code-credentials" [-w]` form
+# matters for our test. Other invocations are ignored.
+case " $* " in
+    *" -s Claude\\ Code-credentials "*|*" -s 'Claude Code-credentials' "*|*" -s Claude\ Code-credentials "*)
+        ;;
+esac
+last=""
+want=0
+for a in "$@"; do
+    case "$a" in
+        -w) want=1 ;;
+        Claude*credentials*) last="$a" ;;
+    esac
+done
+[ "$last" = "Claude Code-credentials" ] || exit 1
+if [ -n "${FAKE_KEYCHAIN_HAS_CRED:-}" ]; then
+    if [ "$want" -eq 1 ]; then
+        printf '%s\n' "${FAKE_KEYCHAIN_PAYLOAD:-{\"claudeAiOauth\":{\"accessToken\":\"sk-ant-fake\"}}}"
+    fi
+    exit 0
+fi
+exit 1
+EOF
+chmod +x "$TMP/fakebin/security"
+
+# Fake `uname` so the macOS-only code paths trigger on whatever host runs the tests.
+cat > "$TMP/fakebin/uname" <<'EOF'
+#!/usr/bin/env bash
+[ "${FAKE_UNAME:-}" = "" ] && exec /usr/bin/uname "$@"
+printf '%s\n' "$FAKE_UNAME"
+EOF
+chmod +x "$TMP/fakebin/uname"
+
+# Re-source the wrapper so it picks up the fake uname (script_dir caches BASH_SOURCE
+# so this is fine).
+# shellcheck disable=SC1090
+. "$WRAPPER"
+
+# Happy path: keychain has the cred, sync-auth writes the file.
+rm -f "$HOME/.claude/.credentials.json"
+FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED=1 cmd_sync_auth >/dev/null 2>&1 \
+    && ok "sync-auth exits 0 when keychain has the credential" \
+    || bad "sync-auth failed unexpectedly"
+[ -f "$HOME/.claude/.credentials.json" ] \
+    && ok "sync-auth wrote ~/.claude/.credentials.json" \
+    || bad "credentials file not written"
+perms=$(stat -f %p "$HOME/.claude/.credentials.json" 2>/dev/null \
+     || stat -c %a "$HOME/.claude/.credentials.json" 2>/dev/null)
+case "$perms" in
+    *600|600) ok "credentials file is chmod 600" ;;
+    *) bad "wrong perms: $perms" ;;
+esac
+grep -q 'claudeAiOauth' "$HOME/.claude/.credentials.json" \
+    && ok "credentials file contains the keychain payload" \
+    || bad "wrong file contents"
+
+# No keychain entry → sync-auth errors and doesn't leave a stub file.
+# cmd_sync_auth calls `die` which `exit`s, so we wrap in a subshell.
+rm -f "$HOME/.claude/.credentials.json"
+if ( FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED="" cmd_sync_auth 2>/dev/null ); then
+    bad "sync-auth should error when keychain has no credential"
+else
+    ok "sync-auth errors when no keychain credential"
+fi
+[ ! -f "$HOME/.claude/.credentials.json" ] \
+    && ok "sync-auth leaves no stub file on failure" \
+    || bad "stub file written"
+
+# Non-macOS → sync-auth refuses.
+if ( FAKE_UNAME="Linux" cmd_sync_auth 2>/dev/null ); then
+    bad "sync-auth should refuse on non-macOS"
+else
+    ok "sync-auth refuses on non-macOS"
+fi
+
+# _maybe_warn_macos_auth: on Darwin + keychain cred + missing file, prints warning.
+rm -f "$HOME/.claude/.credentials.json"
+out=$(FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED=1 _maybe_warn_macos_auth 2>&1)
+case "$out" in
+    *"keychain has claude credentials"*"isoclaude sync-auth"*)
+        ok "_maybe_warn_macos_auth points the user at sync-auth" ;;
+    *) bad "warning text" "got: $out" ;;
+esac
+
+# When the file already exists, no warning.
+echo '{}' > "$HOME/.claude/.credentials.json"
+out=$(FAKE_UNAME="Darwin" FAKE_KEYCHAIN_HAS_CRED=1 _maybe_warn_macos_auth 2>&1)
+[ -z "$out" ] && ok "no warning when credentials file already present" \
+    || bad "spurious warning" "got: $out"
+
+# When not on macOS, no warning regardless of keychain state.
+out=$(FAKE_UNAME="Linux" FAKE_KEYCHAIN_HAS_CRED=1 _maybe_warn_macos_auth 2>&1)
+[ -z "$out" ] && ok "no warning on non-macOS" || bad "Linux warning: $out"
+
+#-----------------------------------------------------------------------
 printf '\n\033[1mPhase 5: %d passed, %d failed\033[0m\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

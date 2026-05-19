@@ -73,6 +73,7 @@ export HOME="$TMP/home"
 mkdir -p "$HOME/.claude" "$HOME/.ssh"
 echo "[user]" > "$HOME/.gitconfig"
 echo "fake-key" > "$HOME/.ssh/id_ed25519"
+echo '{}' > "$HOME/.claude.json"
 
 export ISOCLAUDE_HOME="$HOME/.isoclaude"
 export ISOCLAUDE_RUNTIME="docker"
@@ -262,6 +263,10 @@ case "$flags" in
     *) bad "missing ~/.claude mount" "flags: $flags" ;;
 esac
 case "$flags" in
+    *"-v $HOME/.claude.json:/home/claude/.claude.json"*) ok "mounts ~/.claude.json rw" ;;
+    *) bad "missing ~/.claude.json mount" "flags: $flags" ;;
+esac
+case "$flags" in
     *":/home/claude/.gitconfig:ro"*) ok "mounts ~/.gitconfig ro" ;;
     *) bad "missing ~/.gitconfig mount" "flags: $flags" ;;
 esac
@@ -283,7 +288,7 @@ case "$flags" in
 esac
 
 # Missing host files → wrapper should warn, not crash.
-rm -f "$HOME/.gitconfig"
+rm -f "$HOME/.gitconfig" "$HOME/.claude.json"
 rm -rf "$HOME/.ssh"
 compose_run_flags 2>/dev/null
 flags="${RUN_FLAGS[*]}"
@@ -295,7 +300,13 @@ case "$flags" in
     *".ssh"*) bad "should skip missing .ssh" ;;
     *) ok "skips ~/.ssh mount when host dir missing" ;;
 esac
-mkdir -p "$HOME/.ssh"; echo k > "$HOME/.ssh/id_ed25519"; echo "[user]" > "$HOME/.gitconfig"
+case "$flags" in
+    *".claude.json"*) bad "should skip missing ~/.claude.json" ;;
+    *) ok "skips ~/.claude.json mount when host file missing" ;;
+esac
+mkdir -p "$HOME/.ssh"; echo k > "$HOME/.ssh/id_ed25519"
+echo "[user]" > "$HOME/.gitconfig"
+echo '{}' > "$HOME/.claude.json"
 
 #-----------------------------------------------------------------------
 section "_exec_in_sandbox with ISOCLAUDE_DRY_RUN"
