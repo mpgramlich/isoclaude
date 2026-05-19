@@ -236,15 +236,41 @@ compose_run_flags() {
     _add "-e" "TERM"
     _add "-e" "COLORTERM"
 
-    # Project-level overlays: env-files and extra mounts. local/ overrides
-    # the committed copy by being listed second (docker takes later values).
+    # Project-level overlays: env vars and extra mounts. local/ overrides
+    # the committed copy by being listed second (docker takes later -e).
     if [ -n "${PROJECT_ROOT:-}" ]; then
         local d="$PROJECT_ROOT/.isoclaude"
-        [ -f "$d/env"       ] && _add "--env-file" "$d/env"
-        [ -f "$d/local/env" ] && _add "--env-file" "$d/local/env"
+        _add_project_env "$d/env"
+        _add_project_env "$d/local/env"
         _add_project_mounts "$d/mounts"
         _add_project_mounts "$d/local/mounts"
     fi
+}
+
+# Read a KEY=VALUE env file and add each entry as `-e KEY=VALUE`. We parse
+# the file ourselves (rather than using --env-file) because runtime
+# parsers vary in strictness — Apple container fails the entire run with
+# "no variable name on line '=foo'" instead of skipping it. Doing the
+# parsing here lets us warn cleanly and keep going.
+_add_project_env() {
+    local file="$1" line trimmed
+    [ -f "$file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Strip leading whitespace; skip blanks and comments.
+        trimmed="${line#"${line%%[![:space:]]*}"}"
+        case "$trimmed" in
+            ""|"#"*) continue ;;
+            =*)
+                warn "$file: skipping line with empty key: $line"
+                continue ;;
+            *=*)
+                _add "-e" "$trimmed"
+                ;;
+            *)
+                warn "$file: skipping line without '=': $line"
+                continue ;;
+        esac
+    done < "$file"
 }
 
 # Read a mounts file, one spec per line, format: /host:/container[:ro|:rw].

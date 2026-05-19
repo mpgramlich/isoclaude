@@ -81,36 +81,67 @@ reset_proj() {
 }
 
 #-----------------------------------------------------------------------
-section "env files: wiring + local override"
+section "env files: wiring + local override + malformed-line tolerance"
 
 reset_proj
 echo 'FOO=bar' > "$TMP/proj/.isoclaude/env"
 compose_run_flags
 flags="${RUN_FLAGS[*]}"
 case "$flags" in
-    *"--env-file $TMP/proj/.isoclaude/env"*) ok "adds --env-file for committed env" ;;
+    *"-e FOO=bar"*) ok "adds -e KEY=VALUE for committed env" ;;
     *) bad "committed env missing" "flags: $flags" ;;
 esac
 
 echo 'FOO=overridden' > "$TMP/proj/.isoclaude/local/env"
 compose_run_flags
 flags="${RUN_FLAGS[*]}"
-# Committed must come before local (docker takes later precedence).
-committed_pos=${flags%%"--env-file $TMP/proj/.isoclaude/env"*}
-local_pos=${flags%%"--env-file $TMP/proj/.isoclaude/local/env"*}
+# Committed must come before local (later -e wins in docker).
+committed_pos=${flags%%"-e FOO=bar"*}
+local_pos=${flags%%"-e FOO=overridden"*}
 if [ ${#committed_pos} -lt ${#local_pos} ]; then
-    ok "local/env follows committed env (so local wins in docker)"
+    ok "local/env -e flags follow committed -e (so local wins)"
 else
     bad "ordering" "committed pos=${#committed_pos}, local pos=${#local_pos}"
 fi
 
-# Missing env file: no --env-file flag.
+# Missing env file: no env -e additions.
 rm "$TMP/proj/.isoclaude/env" "$TMP/proj/.isoclaude/local/env"
 compose_run_flags
 flags="${RUN_FLAGS[*]}"
 case "$flags" in
-    *--env-file*) bad "still adds --env-file with no env files" ;;
-    *) ok "no --env-file when no env files present" ;;
+    *"-e FOO=bar"*|*"-e FOO=overridden"*) bad "leftover env -e" "flags: $flags" ;;
+    *) ok "no project env -e when no env files" ;;
+esac
+
+# Malformed env file: must NOT crash the wrapper and must NOT pass bad
+# lines to the runtime (Apple container rejects them and fails the run).
+cat > "$TMP/proj/.isoclaude/env" <<'EOF'
+# A comment
+GOOD=ok
+this-line-has-no-equals
+=empty-key-value
+ANOTHER=also-ok
+EOF
+# Capture stderr to a file (warnings) but let compose_run_flags run in the
+# parent shell so RUN_FLAGS mutations propagate.
+compose_run_flags 2>"$TMP/cf.err"
+flags="${RUN_FLAGS[*]}"
+out=$(cat "$TMP/cf.err")
+case "$flags" in
+    *"-e GOOD=ok"*"-e ANOTHER=also-ok"*) ok "keeps valid env lines from a mixed file" ;;
+    *) bad "valid lines dropped" "flags: $flags" ;;
+esac
+case "$flags" in
+    *"this-line-has-no-equals"*|*"=empty-key-value"*) bad "bad lines reached the runtime" "flags: $flags" ;;
+    *) ok "skips malformed env lines" ;;
+esac
+case "$out" in
+    *"skipping line without '='"*"this-line-has-no-equals"*) ok "warns on no-equals line" ;;
+    *) bad "no warning for missing =" "got: $out" ;;
+esac
+case "$out" in
+    *"skipping line with empty key"*"=empty-key-value"*) ok "warns on empty-key line" ;;
+    *) bad "no warning for empty key" "got: $out" ;;
 esac
 
 #-----------------------------------------------------------------------
@@ -270,8 +301,8 @@ out=$(cd "$TMP/proj" && \
       "$WRAPPER" --some-claude-flag 2>&1 | tail -1)
 
 case "$out" in
-    *--env-file*proj/.isoclaude/env*--env-file*local/env*) ok "both env-files appear in order" ;;
-    *) bad "env-files in dispatcher path" "got: $out" ;;
+    *"-e PROJ_VAR=set"*"-e LOCAL_VAR=set"*) ok "both env files reach docker as -e flags, in order" ;;
+    *) bad "env -e flags missing or out of order" "got: $out" ;;
 esac
 case "$out" in
     *-v\ /tmp/data:/data:ro*) ok "committed mount in run command" ;;
