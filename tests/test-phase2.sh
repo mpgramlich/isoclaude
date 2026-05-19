@@ -233,20 +233,13 @@ case "$flags" in
     *"--rm"*) ok "passes --rm" ;;
     *) bad "missing --rm" "flags: $flags" ;;
 esac
-# -i / -t are added independently and only when stdin/stdout are TTYs.
-# This test harness usually has no TTY, so verify the wrapper doesn't
-# blindly request -t when there's no terminal (would break Apple container).
-if [ -t 0 ]; then
-    case "$flags" in
-        *" -i "*|*" -i") ok "adds -i when stdin is a TTY" ;;
-        *) bad "missing -i with TTY stdin" "flags: $flags" ;;
-    esac
-else
-    case "$flags" in
-        *" -i "*|*" -i") bad "adds -i without a TTY" "flags: $flags" ;;
-        *) ok "omits -i when no TTY stdin (Apple container safe)" ;;
-    esac
-fi
+# -i is always added (so piped stdin gets forwarded). -t is gated on
+# stdout being a real TTY (Apple container errors with ENODEV if -t is
+# requested without one).
+case "$flags" in
+    *" -i "*|*" -i") ok "always passes -i (so piped stdin reaches the container)" ;;
+    *) bad "missing -i" "flags: $flags" ;;
+esac
 if [ -t 1 ]; then
     case "$flags" in
         *" -t "*|*" -t") ok "adds -t when stdout is a TTY" ;;

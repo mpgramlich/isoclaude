@@ -187,10 +187,14 @@ _add_mount()  { _add "-v" "$1"; }
 compose_run_flags() {
     RUN_FLAGS=()
     _add "--rm"
-    # Allocate interactive stdin / tty only when this shell actually has
-    # them. Apple `container` errors with ENODEV if -t is requested without
-    # a real tty, and docker just suppresses input echo unnecessarily.
-    [ -t 0 ] && _add "-i"
+    # Always pass -i so a piped stdin (e.g. `echo "prompt" | isoclaude
+    # --print`) is forwarded into the container. -i without anything on
+    # stdin is a harmless no-op; not passing it when stdin is a pipe makes
+    # claude inside report "Input must be provided either through stdin or
+    # as a prompt argument".
+    # -t is gated on stdout being a real TTY because Apple `container`
+    # errors with ENODEV if -t is requested without one.
+    _add "-i"
     [ -t 1 ] && _add "-t"
 
     # Working dir: bind-mount $PWD at same path and CD there.
