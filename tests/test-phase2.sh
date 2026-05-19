@@ -233,13 +233,20 @@ case "$flags" in
     *"--rm"*) ok "passes --rm" ;;
     *) bad "missing --rm" "flags: $flags" ;;
 esac
-# -i is always added (so piped stdin gets forwarded). -t is gated on
-# stdout being a real TTY (Apple container errors with ENODEV if -t is
-# requested without one).
-case "$flags" in
-    *" -i "*|*" -i") ok "always passes -i (so piped stdin reaches the container)" ;;
-    *) bad "missing -i" "flags: $flags" ;;
-esac
+# -i is added when stdin has content to forward (TTY, pipe, non-empty
+# file). In the bare test-harness context stdin is a socket/closed, so -i
+# should be absent.
+if [ -t 0 ] || [ -p /dev/stdin ] || [ -s /dev/stdin ]; then
+    case "$flags" in
+        *" -i "*|*" -i") ok "adds -i when stdin has content" ;;
+        *) bad "missing -i despite stdin having content" "flags: $flags" ;;
+    esac
+else
+    case "$flags" in
+        *" -i "*|*" -i") bad "added -i with no stdin content (would block claude waiting for input)" "flags: $flags" ;;
+        *) ok "omits -i when stdin is empty (claude won't wait for nonexistent input)" ;;
+    esac
+fi
 if [ -t 1 ]; then
     case "$flags" in
         *" -t "*|*" -t") ok "adds -t when stdout is a TTY" ;;
