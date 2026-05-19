@@ -200,7 +200,12 @@ compose_run_flags() {
     fi
     [ -t 1 ] && _add "-t"
 
-    # Working dir: bind-mount $PWD at same path and CD there.
+    # Working dir: bind-mount $PWD at same path and CD there. Refuse PWD=/
+    # outright — mounting / over the container's rootfs breaks /proc, /dev,
+    # /sys (Apple container errors with a fairly cryptic mount errno 30).
+    if [ "$PWD" = "/" ]; then
+        die "isoclaude refuses to run with PWD=/ (would overlay the container's rootfs); cd to a subdirectory first"
+    fi
     _add_mount "$PWD:$PWD"
     _add "-w" "$PWD"
 

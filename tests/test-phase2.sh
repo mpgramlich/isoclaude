@@ -266,6 +266,14 @@ case "$flags" in
     *"-w $PWD"*) ok "sets workdir to \$PWD" ;;
     *) bad "missing -w" "flags: $flags" ;;
 esac
+
+# PWD=/ should be refused — bind-mounting / over the container's rootfs
+# clobbers /proc /dev /sys and produces a cryptic runtime error.
+out=$( ( cd "$TMP/proj" && PWD=/ && compose_run_flags ) 2>&1 || true )
+case "$out" in
+    *"refuses to run with PWD=/"*) ok "refuses PWD=/ with a clear error" ;;
+    *) bad "no PWD=/ guard" "got: $out" ;;
+esac
 case "$flags" in
     *"-v $HOME/.claude:/home/claude/.claude"*) ok "mounts ~/.claude rw" ;;
     *) bad "missing ~/.claude mount" "flags: $flags" ;;
