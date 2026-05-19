@@ -511,6 +511,136 @@ cmd_pin() {
     ensure_base_image "$runtime" "$version"
 }
 
+# List isoclaude images of the given type ("base" or "project") that exist
+# in the runtime. Emits one "<name>:<tag>" per line. The image name appears
+# alone in column 1 of `image list`; the tag is in column 2.
+_list_isoclaude_images() {
+    local runtime="$1" kind="$2" pat
+    case "$kind" in
+        base)    pat='^isoclaude-base$' ;;
+        project) pat='^isoclaude-project-' ;;
+        *)       die "internal: unknown image kind '$kind'" ;;
+    esac
+    "$runtime" image list 2>/dev/null \
+        | awk -v p="$pat" '
+            NR==1 { next }
+            $1 ~ p {
+                tag = ($2 == "" || $2 == "<none>") ? "latest" : $2
+                print $1":"tag
+            }'
+}
+
+cmd_prune() {
+    local nuke_all=0
+    case "${1:-}" in
+        --all|-a) nuke_all=1 ;;
+        "") ;;
+        *) die "unknown arg to prune: $1" ;;
+    esac
+
+    local runtime current_hash="" img hash kept=0 removed=0
+    runtime="$(detect_runtime)"
+
+    # Identify the project's current Dockerfile hash so we don't evict the
+    # image we're about to use (unless --all).
+    if [ "$nuke_all" -eq 0 ]; then
+        local proj
+        proj="$(project_root)"
+        if [ -n "$proj" ] && [ -f "$proj/.isoclaude/Dockerfile" ] \
+                && grep -qE '^FROM[[:space:]]' "$proj/.isoclaude/Dockerfile"; then
+            current_hash="$(_file_hash "$proj/.isoclaude/Dockerfile")"
+        fi
+    fi
+
+    while IFS= read -r img; do
+        [ -z "$img" ] && continue
+        # img is like "isoclaude-project-<hash>:latest"
+        hash="${img#isoclaude-project-}"
+        hash="${hash%:*}"
+        if [ -n "$current_hash" ] && [ "$hash" = "$current_hash" ]; then
+            log "  keep:   $img (current project)"
+            kept=$((kept + 1))
+            continue
+        fi
+        "$runtime" image rm "$img" >/dev/null 2>&1 \
+            && { log "  remove: $img"; removed=$((removed + 1)); } \
+            || warn "  failed: $img"
+    done <<<"$(_list_isoclaude_images "$runtime" project)"
+
+    log "pruned $removed project image(s), kept $kept"
+}
+
+cmd_uninstall() {
+    local purge=0 yes=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --purge)  purge=1 ;;
+            --yes|-y) yes=1 ;;
+            *) die "unknown arg to uninstall: $1" ;;
+        esac
+        shift
+    done
+
+    local self runtime
+    self="$(_self_path)"
+    runtime="$(detect_runtime 2>/dev/null || true)"
+
+    printf 'will remove:\n'
+    printf '  %s\n' "$self"
+    [ -d "$ISOCLAUDE_HOME" ] && printf '  %s\n' "$ISOCLAUDE_HOME"
+    if [ "$purge" -eq 1 ] && [ -n "$runtime" ]; then
+        local img
+        for img in $(_list_isoclaude_images "$runtime" base) \
+                   $(_list_isoclaude_images "$runtime" project); do
+            printf '  image: %s\n' "$img"
+        done
+    fi
+
+    if [ "$yes" -eq 0 ]; then
+        printf 'proceed? [y/N] '
+        local ans
+        read -r ans
+        case "$ans" in
+            y|Y|yes|YES) ;;
+            *) log "cancelled"; return 0 ;;
+        esac
+    fi
+
+    if [ "$purge" -eq 1 ] && [ -n "$runtime" ]; then
+        local img
+        for img in $(_list_isoclaude_images "$runtime" base) \
+                   $(_list_isoclaude_images "$runtime" project); do
+            "$runtime" image rm "$img" >/dev/null 2>&1 \
+                && log "removed image $img" \
+                || warn "couldn't remove $img"
+        done
+    fi
+
+    [ -d "$ISOCLAUDE_HOME" ] && rm -rf "$ISOCLAUDE_HOME" && log "removed $ISOCLAUDE_HOME"
+
+    # Self-removal: the kernel keeps the inode alive until this process
+    # exits, so we can rm $self mid-flight without breaking the script.
+    if [ -L "$self" ] || [ -f "$self" ]; then
+        if rm "$self" 2>/dev/null; then
+            log "removed $self"
+        else
+            warn "couldn't remove $self (try: sudo rm $self)"
+        fi
+    fi
+    log "uninstalled"
+}
+
+# Best-effort path to this script, resolving symlinks like script_dir does.
+_self_path() {
+    local src="${BASH_SOURCE[0]}" dir
+    while [ -L "$src" ]; do
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+    done
+    printf '%s\n' "$src"
+}
+
 cmd_help() {
     cat <<'EOF'
 isoclaude — run Claude Code in a sandboxed container.
@@ -535,6 +665,11 @@ SUBCOMMANDS
     update --check          Compare global pin to npm latest, no changes.
     pin [VERSION]           Set per-project pin to VERSION (default:
                             current global pin) and rebuild.
+    prune [--all]           Remove built project images. Without --all,
+                            keeps the current project's active image.
+    uninstall [--purge]     Remove the wrapper and ~/.isoclaude/. With
+              [--yes|-y]    --purge, also removes all isoclaude images.
+                            Prompts for confirmation unless --yes.
     help                    Show this message.
 
 GLOBAL FLAGS
@@ -576,6 +711,8 @@ main() {
         version)        shift; cmd_version "$@" ;;
         update)         shift; cmd_update "$@" ;;
         pin)            shift; cmd_pin "$@" ;;
+        prune)          shift; cmd_prune "$@" ;;
+        uninstall)      shift; cmd_uninstall "$@" ;;
         help|-h|--help) cmd_help ;;
         --)             shift; cmd_run "$@" ;;
         "")             cmd_run ;;
