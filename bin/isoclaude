@@ -10,6 +10,10 @@
 
 set -eo pipefail
 
+if [ -z "${HOME:-}" ]; then
+    printf '\033[31misoclaude:\033[0m HOME is not set; isoclaude needs it for state, auth, and mount targets\n' >&2
+    exit 1
+fi
 ISOCLAUDE_HOME="${ISOCLAUDE_HOME:-$HOME/.isoclaude}"
 ISOCLAUDE_BASE_IMAGE="${ISOCLAUDE_BASE_IMAGE:-isoclaude-base:latest}"
 NPM_PACKAGE="@anthropic-ai/claude-code"
