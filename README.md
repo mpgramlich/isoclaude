@@ -167,24 +167,26 @@ One bind-mount spec per line. `~` is expanded host-side. Format:
 /opt/secrets:/secrets:ro
 ```
 
-### MCP servers (auto-mount)
+### MCP servers
 
-When the wrapper starts, it scans `.mcp.json` in the project root and the
-`mcpServers` section of `~/.claude.json`. For each server whose
-`command` is an absolute host path that exists, the wrapper bind-mounts
-the command's parent dir into the container at the same path (`ro`), so
-the in-container claude can spawn the same server as the host. Skipped
-silently if the command is relative or non-existent; warned-and-skipped
-if it lives under a system path that would shadow container
-infrastructure (`/usr`, `/bin`, `/sbin`, `/lib*`, `/etc`, `/var`,
-`/proc`, `/sys`, `/dev`). Paths already covered by `$PWD` or `~/.claude`
-aren't re-mounted.
+The container is its own self-contained environment, so MCP servers
+that need to run inside it should be installed inside it. The cleanest
+pattern is to add the install step to `.isoclaude/Dockerfile`:
 
-This is zero-configuration — typical macOS install locations like
-`/opt/homebrew/...` and `/Users/<you>/...` Just Work. For MCP servers
-that won't run cross-platform (Mach-O binaries on a macOS host with a
-Linux container), claude inside fails per-server but the others keep
-working.
+```dockerfile
+FROM isoclaude-base:latest
+RUN npm install -g @some-org/some-mcp-server
+# or: RUN apt-get update && apt-get install -y some-mcp-server-pkg
+```
+
+For an ad-hoc install at runtime, claude inside can `sudo apt-get
+install ...` or `sudo npm install -g ...` directly (the `claude` user
+has passwordless sudo).
+
+For the (rare) case where you really want to bind in a cross-platform
+script from the host, list its directory in `.isoclaude/mounts`. There
+is no auto-discovery from `.mcp.json` — it produced surprising mounts
+and fell over for native binaries.
 
 ### `claude-version`
 
