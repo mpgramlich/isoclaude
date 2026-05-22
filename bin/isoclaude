@@ -225,13 +225,6 @@ compose_run_flags() {
     _add_mount "$PWD:$PWD"
     _add "-w" "$PWD"
 
-    # Auth/credentials (rw so login persists). Claude stores all of:
-    #   ~/.claude/                       session history, projects, backups
-    #   ~/.claude.json                   the actual config (incl. settings)
-    #   ~/.claude/.credentials.json      OAuth tokens, on Linux installs and
-    #                                    on macOS installs after sync-auth.
-    # macOS native installs keep credentials in the keychain instead; see
-    # _maybe_warn_macos_auth below.
     # Create ~/.claude on demand. Without it the bind mount fails on
     # runtimes that don't auto-create the source ("path does not exist"
     # on Apple container), and the in-container claude has no place to
@@ -241,6 +234,23 @@ compose_run_flags() {
         _add_mount "$HOME/.claude:/home/claude/.claude"
     else
         warn "$HOME/.claude could not be created; session state won't persist"
+    fi
+
+    # Per-project plugin isolation: when we're in a project, override
+    # /home/claude/.claude/plugins with the project's own gitignored dir
+    # so each project has its own plugin set (a plugin installed in
+    # project A isn't visible from project B). The host's plugins dir
+    # gets re-mounted ro at /home/claude/.claude/host-plugins so the
+    # user can still browse or copy from it.
+    if [ -n "${PROJECT_ROOT:-}" ]; then
+        local pp="$PROJECT_ROOT/.isoclaude/local/plugins"
+        mkdir -p "$pp" 2>/dev/null || true
+        if [ -d "$pp" ]; then
+            _add_mount "$pp:/home/claude/.claude/plugins"
+        fi
+        if [ -d "$HOME/.claude/plugins" ]; then
+            _add_mount "$HOME/.claude/plugins:/home/claude/.claude/host-plugins:ro"
+        fi
     fi
     if [ -f "$HOME/.claude.json" ]; then
         _add_mount "$HOME/.claude.json:/home/claude/.claude.json"

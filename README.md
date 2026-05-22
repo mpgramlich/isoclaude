@@ -172,6 +172,31 @@ One bind-mount spec per line. `~` is expanded host-side. Format:
 Host paths that don't exist get a warning and are skipped (instead of
 producing a cryptic runtime error).
 
+### Plugins (per-project isolation)
+
+When the wrapper detects a project root (anywhere with a `.isoclaude/`
+walking up from PWD), it mounts `<project>/.isoclaude/local/plugins`
+over the in-container `~/.claude/plugins`, so each project has its own
+plugin set:
+
+- Plugin installed in project A → only project A sees it.
+- The host's `~/.claude/plugins` is hidden from inside, so the
+  in-container claude doesn't pick up unrelated host plugins.
+- Plugins persist on the host at `<project>/.isoclaude/local/plugins/`
+  (gitignored via `local/` so they don't get committed).
+
+As a reference, the host's plugins are also re-mounted **read-only** at
+`~/.claude/host-plugins` inside the container — useful when you want to
+copy a plugin in from your host setup:
+
+```sh
+# inside the sandbox
+cp -r ~/.claude/host-plugins/marketplaces/some-plugin ~/.claude/plugins/marketplaces/
+```
+
+Without a `.isoclaude/` (ad-hoc usage), no override happens and the
+host's plugins are visible as usual.
+
 ### MCP servers
 
 The container is self-contained. If a project needs an MCP server,

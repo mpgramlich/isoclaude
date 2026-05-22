@@ -339,6 +339,50 @@ case "$out" in
 esac
 
 #-----------------------------------------------------------------------
+section "Per-project plugin isolation"
+
+reset_proj
+mkdir -p "$HOME/.claude/plugins/marketplaces/host-only"  # simulate a host plugin
+compose_run_flags 2>/dev/null
+flags="${RUN_FLAGS[*]}"
+
+# With a project: the project's local/plugins overlays the parent ~/.claude
+# mount at the plugins subdir, isolating per-project state.
+case "$flags" in
+    *"-v $TMP/proj/.isoclaude/local/plugins:/home/claude/.claude/plugins"*)
+        ok "mounts project-local plugins over /home/claude/.claude/plugins" ;;
+    *) bad "project plugins mount missing" "flags: $flags" ;;
+esac
+# That dir should also exist on the host afterwards (auto-created).
+[ -d "$TMP/proj/.isoclaude/local/plugins" ] \
+    && ok "project's local/plugins dir is created on demand" \
+    || bad "project's local/plugins not created"
+
+# Stretch goal: host plugins also bound in ro, at host-plugins, so the
+# user can still browse or copy from them.
+case "$flags" in
+    *"-v $HOME/.claude/plugins:/home/claude/.claude/host-plugins:ro"*)
+        ok "host plugins remounted ro at /home/claude/.claude/host-plugins" ;;
+    *) bad "host-plugins ro mount missing" "flags: $flags" ;;
+esac
+
+# Without a project root: no plugin override; host plugins visible
+# via the parent ~/.claude mount as usual.
+PROJECT_ROOT=""
+compose_run_flags 2>/dev/null
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    *"/home/claude/.claude/plugins"*)
+        bad "shouldn't override plugins when there's no project" ;;
+    *) ok "no plugin override when there's no project root" ;;
+esac
+case "$flags" in
+    *"host-plugins"*)
+        bad "host-plugins mount should be project-scoped" ;;
+    *) ok "no host-plugins mount when there's no project root" ;;
+esac
+
+#-----------------------------------------------------------------------
 section "cmd_version reports project image"
 
 reset_proj
