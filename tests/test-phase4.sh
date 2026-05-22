@@ -297,6 +297,122 @@ case "$out" in
 esac
 
 #-----------------------------------------------------------------------
+section "_add_mcp_mounts: discover MCP server dirs from .mcp.json"
+
+reset_proj
+mkdir -p "$TMP/mcp-servers" "$TMP/another-mcp"
+# Two real command files. One in $TMP/mcp-servers, one in $TMP/another-mcp.
+echo '#!/usr/bin/env node' > "$TMP/mcp-servers/server.js"; chmod +x "$TMP/mcp-servers/server.js"
+echo '#!/usr/bin/env python3' > "$TMP/another-mcp/srv.py";   chmod +x "$TMP/another-mcp/srv.py"
+
+cat > "$TMP/proj/.mcp.json" <<EOF
+{
+  "mcpServers": {
+    "alpha": {"command": "$TMP/mcp-servers/server.js"},
+    "beta":  {"command": "$TMP/another-mcp/srv.py"},
+    "gamma": {"command": "$TMP/mcp-servers/server.js"}
+  }
+}
+EOF
+
+compose_run_flags 2>"$TMP/cf.err"
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    *"-v $TMP/mcp-servers:$TMP/mcp-servers:ro"*) ok "mounts dir of MCP server alpha" ;;
+    *) bad "alpha mount missing" "flags: $flags" ;;
+esac
+case "$flags" in
+    *"-v $TMP/another-mcp:$TMP/another-mcp:ro"*) ok "mounts dir of MCP server beta" ;;
+    *) bad "beta mount missing" "flags: $flags" ;;
+esac
+# alpha and gamma share a parent — should be mounted ONCE.
+hits=$(printf '%s\n' "${RUN_FLAGS[@]}" | grep -c "$TMP/mcp-servers")
+[ "$hits" -eq 1 ] && ok "dedupes shared parent dir (alpha + gamma)" \
+    || bad "expected 1 mount for $TMP/mcp-servers, got $hits"
+
+# Relative or non-existent commands are ignored.
+cat > "$TMP/proj/.mcp.json" <<'EOF'
+{
+  "mcpServers": {
+    "rel":   {"command": "node"},
+    "miss":  {"command": "/nope/does-not-exist"}
+  }
+}
+EOF
+compose_run_flags 2>/dev/null
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    *"-v node:"*|*"-v /nope/"*) bad "added mount for relative/missing command" ;;
+    *) ok "ignores relative and non-existent commands" ;;
+esac
+
+# System paths get skipped with a stderr warning so they don't shadow
+# container infrastructure like /usr/local/bin/claude.
+cat > "$TMP/proj/.mcp.json" <<'EOF'
+{
+  "mcpServers": {
+    "shady": {"command": "/usr/bin/env"}
+  }
+}
+EOF
+compose_run_flags 2>"$TMP/cf.err"
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    *"-v /usr/"*) bad "mounted system path /usr/bin (would shadow container)" ;;
+    *) ok "skips MCP commands in system paths (/usr/bin)" ;;
+esac
+case "$(cat "$TMP/cf.err")" in
+    *"skipping MCP system path"*"/usr/bin"*) ok "warns about skipped system path" ;;
+    *) bad "no skip warning" "stderr: $(cat "$TMP/cf.err")" ;;
+esac
+
+# Commands inside $PWD or ~/.claude are already mounted; no duplicate.
+mkdir -p "$TMP/proj/local-srv"
+echo '#!/bin/sh' > "$TMP/proj/local-srv/x"; chmod +x "$TMP/proj/local-srv/x"
+mkdir -p "$HOME/.claude/mcp"; echo '#!/bin/sh' > "$HOME/.claude/mcp/y"; chmod +x "$HOME/.claude/mcp/y"
+cat > "$TMP/proj/.mcp.json" <<EOF
+{
+  "mcpServers": {
+    "in-proj": {"command": "$TMP/proj/local-srv/x"},
+    "in-home": {"command": "$HOME/.claude/mcp/y"}
+  }
+}
+EOF
+compose_run_flags 2>/dev/null
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    *"-v $TMP/proj/local-srv:"*) bad "duplicated mount for command inside \$PWD" ;;
+    *) ok "skips MCP command inside \$PWD (already mounted)" ;;
+esac
+case "$flags" in
+    *"-v $HOME/.claude/mcp:"*) bad "duplicated mount for command inside ~/.claude" ;;
+    *) ok "skips MCP command inside ~/.claude (already mounted)" ;;
+esac
+
+# Malformed JSON in .mcp.json should be ignored, not crash.
+echo "{ not valid json" > "$TMP/proj/.mcp.json"
+compose_run_flags 2>/dev/null
+ok "malformed .mcp.json doesn't crash compose_run_flags"
+
+# ~/.claude.json mcpServers section is also read.
+cat > "$HOME/.claude.json" <<EOF
+{
+  "mcpServers": {
+    "user-srv": {"command": "$TMP/another-mcp/srv.py"}
+  }
+}
+EOF
+rm -f "$TMP/proj/.mcp.json"
+compose_run_flags 2>/dev/null
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    *"-v $TMP/another-mcp:$TMP/another-mcp:ro"*) ok "reads mcpServers from ~/.claude.json" ;;
+    *) bad "user-level mcpServers not picked up" "flags: $flags" ;;
+esac
+# Restore the regular ~/.claude.json for downstream tests.
+echo '{}' > "$HOME/.claude.json"
+
+#-----------------------------------------------------------------------
 section "End-to-end: all four overlays integrated"
 
 reset_proj

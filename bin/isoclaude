@@ -278,6 +278,11 @@ compose_run_flags() {
         _add_project_mounts "$d/mounts"
         _add_project_mounts "$d/local/mounts"
     fi
+
+    # MCP servers configured at the user or project level: parse their
+    # `command` paths and bind-mount each parent dir so the in-container
+    # claude can spawn the same MCP servers as the host.
+    _add_mcp_mounts
 }
 
 # Read a KEY=VALUE env file and add each entry as `-e KEY=VALUE`. We parse
@@ -307,6 +312,88 @@ _add_project_env() {
                 continue ;;
         esac
     done < "$file"
+}
+
+# Discover MCP server commands from .mcp.json (project) and ~/.claude.json
+# (user) and add ro bind-mounts for each command's parent dir, so the in-
+# container claude can spawn the same servers as the host. Skips paths
+# under system dirs whose bind-mount would shadow the container's
+# infrastructure (/usr, /bin, /sbin, /lib*, /etc, /var, /proc, /sys, /dev).
+# Dedupes; skips paths already covered by $PWD or ~/.claude. Idempotent.
+_add_mcp_mounts() {
+    local sources=()
+    [ -f "$HOME/.claude.json" ] && sources+=("$HOME/.claude.json")
+
+    # Find the nearest .mcp.json by walking up from PWD (matches claude).
+    local dir="$PWD"
+    while :; do
+        if [ -f "$dir/.mcp.json" ]; then
+            sources+=("$dir/.mcp.json")
+            break
+        fi
+        if [ "$dir" = "/" ] || [ "$dir" = "$HOME" ]; then break; fi
+        dir="$(dirname "$dir")"
+    done
+
+    [ "${#sources[@]}" -eq 0 ] && return 0
+
+    # Python3 is the JSON parser we already use. Emits unique parent dirs
+    # (stdout, one per line) and warnings (stderr) for skipped system paths.
+    local mounts
+    mounts=$(python3 - "${sources[@]}" <<'PY'
+import sys, os, json
+UNSAFE = ("/bin", "/sbin", "/lib", "/lib32", "/lib64",
+          "/etc", "/usr", "/var", "/proc", "/sys", "/dev")
+def is_unsafe(p):
+    if p in UNSAFE:
+        return True
+    for u in UNSAFE:
+        if p.startswith(u + "/"):
+            return True
+    return False
+covered = set()
+pwd = os.environ.get("PWD")
+home = os.environ.get("HOME", "")
+if pwd: covered.add(pwd)
+if home: covered.add(os.path.join(home, ".claude"))
+seen = set()
+for src in sys.argv[1:]:
+    try:
+        with open(src) as f:
+            data = json.load(f)
+    except Exception:
+        continue
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        continue
+    for name, cfg in servers.items():
+        if not isinstance(cfg, dict):
+            continue
+        cmd = cfg.get("command")
+        if not isinstance(cmd, str) or not cmd.startswith("/"):
+            continue
+        if not os.path.exists(cmd):
+            continue
+        parent = os.path.dirname(cmd) or "/"
+        if any(parent == d or parent.startswith(d + "/") for d in covered):
+            continue
+        if is_unsafe(parent):
+            sys.stderr.write(
+                "isoclaude: skipping MCP system path (would shadow container): "
+                f"{parent} (server '{name}')\n")
+            continue
+        if parent not in seen:
+            seen.add(parent)
+            print(parent)
+PY
+)
+
+    local d
+    while IFS= read -r d || [ -n "$d" ]; do
+        [ -z "$d" ] && continue
+        log "binding MCP server dir: $d"
+        _add_mount "$d:$d:ro"
+    done <<< "$mounts"
 }
 
 # Read a mounts file, one spec per line, format: /host:/container[:ro|:rw].

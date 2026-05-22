@@ -161,6 +161,25 @@ One bind-mount spec per line. `~` is expanded host-side. Format:
 /opt/secrets:/secrets:ro
 ```
 
+### MCP servers (auto-mount)
+
+When the wrapper starts, it scans `.mcp.json` in the project root and the
+`mcpServers` section of `~/.claude.json`. For each server whose
+`command` is an absolute host path that exists, the wrapper bind-mounts
+the command's parent dir into the container at the same path (`ro`), so
+the in-container claude can spawn the same server as the host. Skipped
+silently if the command is relative or non-existent; warned-and-skipped
+if it lives under a system path that would shadow container
+infrastructure (`/usr`, `/bin`, `/sbin`, `/lib*`, `/etc`, `/var`,
+`/proc`, `/sys`, `/dev`). Paths already covered by `$PWD` or `~/.claude`
+aren't re-mounted.
+
+This is zero-configuration — typical macOS install locations like
+`/opt/homebrew/...` and `/Users/<you>/...` Just Work. For MCP servers
+that won't run cross-platform (Mach-O binaries on a macOS host with a
+Linux container), claude inside fails per-server but the others keep
+working.
+
 ### `claude-version`
 
 ```
