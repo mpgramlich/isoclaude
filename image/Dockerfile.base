@@ -5,7 +5,7 @@
 # the CLAUDE_VERSION build arg, and recorded in an image label so the
 # wrapper can detect drift and trigger rebuilds.
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 ARG CLAUDE_VERSION
 RUN test -n "$CLAUDE_VERSION" || (echo "CLAUDE_VERSION build-arg is required" >&2; exit 1)
