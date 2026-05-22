@@ -12,7 +12,7 @@ RUN test -n "$CLAUDE_VERSION" || (echo "CLAUDE_VERSION build-arg is required" >&
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        ca-certificates curl git gosu gnupg openssh-client \
+        ca-certificates curl git gosu gnupg openssh-client sudo \
  && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && apt-get clean \
@@ -22,6 +22,15 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_VERSION}"
 
 RUN groupadd -g 1000 claude \
  && useradd -m -u 1000 -g 1000 -s /bin/bash claude
+
+# Passwordless sudo for the claude user. The whole container is already a
+# sandbox; the privilege boundary is the container's filesystem (which is
+# thrown away on exit). So we let claude apt-get install / sudo anything
+# inside without an interactive password prompt. claude still runs as a
+# non-root user by default — host-mounted dirs land owned by your host
+# user, not root.
+RUN echo 'claude ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/claude \
+ && chmod 0440 /etc/sudoers.d/claude
 
 # Some bind-mount runtimes (notably Apple `container`) present the mount-
 # point directory as root-owned even when its contents have the correct

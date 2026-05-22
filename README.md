@@ -69,6 +69,12 @@ pinned `claude-code` install. The entrypoint runs briefly as root to
 adjust UIDs/GIDs (handling collisions with pre-existing groups like
 `dialout`), then `exec gosu`s to a non-root `claude` user.
 
+The `claude` user has **passwordless sudo** (`NOPASSWD: ALL`). Files you
+create inside are still owned by your host user (the wrapper preserves
+the UID/GID), but when you need a package, `sudo apt-get install ...`
+just works without a prompt. The privilege boundary is the container's
+ephemeral filesystem; that's the sandbox.
+
 The claude version is recorded as an image label, so the wrapper
 rebuilds automatically when you change your pin and never rebuilds when
 nothing has changed.

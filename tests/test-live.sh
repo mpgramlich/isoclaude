@@ -223,6 +223,23 @@ else
 fi
 
 #-----------------------------------------------------------------------
+section "Passwordless sudo (claude can apt as non-root)"
+
+# `id` is always non-root for the claude user. `sudo true` must succeed
+# without a prompt for the wrapper's "apt without root" promise to hold.
+set +e
+"$runtime" run --rm \
+    -e HOST_UID="$HOST_UID" -e HOST_GID="$HOST_GID" \
+    "$IMG" \
+    sh -c 'id -un; sudo -n true && echo SUDO_OK || echo SUDO_FAIL' \
+    >"$TMP/sudo.out" 2>&1
+set -e
+case "$(cat "$TMP/sudo.out")" in
+    *claude*SUDO_OK*) ok "claude (non-root) has passwordless sudo" ;;
+    *) bad "sudo unavailable to claude" "out: $(cat "$TMP/sudo.out")" ;;
+esac
+
+#-----------------------------------------------------------------------
 section "Phase 3 subcommands against real runtime"
 
 # `version` should report runtime + image label, and not crash.
