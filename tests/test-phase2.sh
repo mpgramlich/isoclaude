@@ -292,8 +292,10 @@ case "$flags" in
     *) bad "missing ~/.claude mount" "flags: $flags" ;;
 esac
 case "$flags" in
-    *"-v $HOME/.claude.json:/home/claude/.claude.json"*) ok "mounts ~/.claude.json rw" ;;
-    *) bad "missing ~/.claude.json mount" "flags: $flags" ;;
+    # The wrapper now uses a per-PWD copy at <pwd>/.isoclaude/local/claude.json
+    # instead of the host file, to avoid concurrent-write corruption.
+    *"-v $PWD/.isoclaude/local/claude.json:/home/claude/.claude.json"*) ok "mounts per-PWD claude.json copy" ;;
+    *) bad "missing per-PWD claude.json mount" "flags: $flags" ;;
 esac
 case "$flags" in
     *":/home/claude/.gitconfig:ro"*) ok "mounts ~/.gitconfig ro" ;;
@@ -319,6 +321,7 @@ esac
 # Missing host files → wrapper should warn, not crash.
 rm -f "$HOME/.gitconfig" "$HOME/.claude.json"
 rm -rf "$HOME/.ssh" "$HOME/.claude"
+rm -rf "$PWD/.isoclaude/local"
 compose_run_flags 2>/dev/null
 flags="${RUN_FLAGS[*]}"
 case "$flags" in
@@ -329,10 +332,11 @@ case "$flags" in
     *".ssh"*) bad "should skip missing .ssh" ;;
     *) ok "skips ~/.ssh mount when host dir missing" ;;
 esac
-case "$flags" in
-    *".claude.json"*) bad "should skip missing ~/.claude.json" ;;
-    *) ok "skips ~/.claude.json mount when host file missing" ;;
-esac
+# The per-PWD claude.json stub still gets created (so the bind mount has
+# a real file to attach to) even when there's no host file to seed from.
+[ -f "$PWD/.isoclaude/local/claude.json" ] \
+    && ok "creates an empty per-PWD claude.json stub when host file missing" \
+    || bad "no stub created when host file missing"
 # ~/.claude should be auto-created if missing so the bind mount works on
 # runtimes that don't auto-create the source (e.g. Apple container).
 [ -d "$HOME/.claude" ] && ok "creates ~/.claude on demand when missing" \

@@ -399,6 +399,78 @@ case "$flags" in
 esac
 
 #-----------------------------------------------------------------------
+section "Per-project .claude.json (seeded from host, isolated thereafter)"
+
+reset_proj
+# Pretend the host has a meaningful .claude.json.
+host_cfg="$HOME/.claude.json"
+echo '{"hostVersion":"original","numStartups":42}' > "$host_cfg"
+
+# 1. First run in a fresh project: copy is seeded from host.
+proj_cfg="$TMP/proj/.isoclaude/local/claude.json"
+rm -f "$proj_cfg"  # ensure absent
+compose_run_flags 2>"$TMP/cf.err"
+flags="${RUN_FLAGS[*]}"
+[ -f "$proj_cfg" ] && ok "first run in project: seeded $proj_cfg from host" \
+    || bad "no seed file" "stderr: $(cat "$TMP/cf.err")"
+grep -q '"hostVersion":"original"' "$proj_cfg" \
+    && ok "seeded contents match host" \
+    || bad "seed content mismatch" "got: $(cat "$proj_cfg")"
+
+# 2. The mount target points at the per-project copy, NOT the host file.
+case "$flags" in
+    *"-v $proj_cfg:/home/claude/.claude.json"*) ok "mounts per-project copy at /home/claude/.claude.json" ;;
+    *) bad "wrong mount path" "flags: $flags" ;;
+esac
+case "$flags" in
+    *"-v $HOME/.claude.json:/home/claude/.claude.json"*) bad "still mounts the host file (would race)" ;;
+    *) ok "host ~/.claude.json is NOT mounted when in a project" ;;
+esac
+
+# 3. Subsequent runs preserve any modifications to the per-project copy.
+echo '{"hostVersion":"original","numStartups":42,"containerEdit":"yes"}' > "$proj_cfg"
+mod_before=$(stat -f %m "$proj_cfg" 2>/dev/null || stat -c %Y "$proj_cfg")
+sleep 1
+compose_run_flags 2>/dev/null
+mod_after=$(stat -f %m "$proj_cfg" 2>/dev/null || stat -c %Y "$proj_cfg")
+[ "$mod_before" = "$mod_after" ] && ok "existing per-project copy is not re-seeded" \
+    || bad "file was re-seeded (mtime changed)"
+grep -q '"containerEdit":"yes"' "$proj_cfg" \
+    && ok "container-side edits survive subsequent runs" \
+    || bad "edits lost"
+
+# 4. Without an explicit project: still uses a per-PWD copy (PWD itself
+#    becomes the effective root; .isoclaude/local/ is auto-created).
+PROJECT_ROOT=""
+no_root_cfg="$TMP/proj/.isoclaude/local/claude.json"
+rm -f "$no_root_cfg"
+rm -rf "$TMP/proj/.isoclaude"  # erase everything; auto-create from scratch
+compose_run_flags 2>/dev/null
+flags="${RUN_FLAGS[*]}"
+[ -f "$no_root_cfg" ] && ok "no project: still auto-creates per-PWD .isoclaude/local/claude.json" \
+    || bad "no-project case: no file created"
+case "$flags" in
+    *"-v $no_root_cfg:/home/claude/.claude.json"*) ok "no project: mounts per-PWD copy" ;;
+    *) bad "no-project mount path wrong" "flags: $flags" ;;
+esac
+case "$flags" in
+    *"-v $HOME/.claude.json:/home/claude/.claude.json"*) bad "still mounts host file directly somewhere" ;;
+    *) ok "host file never mounted directly when PWD has writable .isoclaude/" ;;
+esac
+
+# 5. Project root present but no host file: stub gets created so the
+#    bind mount has a real file to attach to.
+reset_proj
+rm -f "$host_cfg" "$TMP/proj/.isoclaude/local/claude.json"
+compose_run_flags 2>"$TMP/cf.err"
+[ -f "$TMP/proj/.isoclaude/local/claude.json" ] \
+    && ok "no host file: stub claude.json created in project" \
+    || bad "no stub created"
+python3 -c "import json; json.load(open('$TMP/proj/.isoclaude/local/claude.json'))" 2>/dev/null \
+    && ok "stub is valid JSON" \
+    || bad "stub isn't valid JSON"
+
+#-----------------------------------------------------------------------
 section "cmd_version reports project image"
 
 reset_proj

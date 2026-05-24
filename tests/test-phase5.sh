@@ -438,10 +438,13 @@ mkdir -p "$HOME/.ssh"; echo "k" > "$HOME/.ssh/id_ed25519"
 rm -f "$HOME/.claude/.credentials.json"
 
 # Helper: run doctor with the fake runtime + fake security/uname; capture
-# stdout and exit code separately.
+# stdout and exit code separately. Runs from a clean dir (no .isoclaude/
+# anywhere up to /tmp) so the "no project" assertion is stable regardless
+# of which dir the test harness was invoked from.
+mkdir -p "$TMP/clean"
 run_doctor() {
     out=""; rc=0
-    out=$("$WRAPPER" doctor 2>&1) || rc=$?
+    out=$( cd "$TMP/clean" && "$WRAPPER" doctor 2>&1 ) || rc=$?
 }
 
 #--- Happy path: all the bits the harness controls are healthy.

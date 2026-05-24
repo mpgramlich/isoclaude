@@ -262,11 +262,28 @@ compose_run_flags() {
             _add_mount "$HOME/.claude/plugins/marketplaces:$HOME/.claude/plugins/marketplaces:ro"
         fi
     fi
-    if [ -f "$HOME/.claude.json" ]; then
-        _add_mount "$HOME/.claude.json:/home/claude/.claude.json"
-    else
-        warn "$HOME/.claude.json not found; the in-container claude will need /login on first run"
+    # ~/.claude.json gets corrupted when host claude and container claude
+    # write to it concurrently (object-mode JSON, no append-safe). To
+    # avoid that, give each *working directory* its own copy of the file
+    # at <pwd>/.isoclaude/local/claude.json, seeded once from the host.
+    # The container reads and writes its own file; the host is never
+    # raced. The .isoclaude/local/ dir is created on demand even when
+    # the user hasn't run `isoclaude init` — it's gitignored content.
+    local cfg_root="${PROJECT_ROOT:-$PWD}"
+    local proj_cfg="$cfg_root/.isoclaude/local/claude.json"
+    if [ ! -f "$proj_cfg" ]; then
+        mkdir -p "$cfg_root/.isoclaude/local" 2>/dev/null || true
+        if [ -f "$HOME/.claude.json" ]; then
+            cp "$HOME/.claude.json" "$proj_cfg"
+            log "seeded $proj_cfg from $HOME/.claude.json"
+        else
+            # No host file to seed from; create an empty stub so the
+            # bind mount has a real file to attach to.
+            printf '{}\n' > "$proj_cfg"
+            log "no host ~/.claude.json — created empty $proj_cfg"
+        fi
     fi
+    _add_mount "$proj_cfg:/home/claude/.claude.json"
     _macos_auth_check
 
     # Git config (ro).
