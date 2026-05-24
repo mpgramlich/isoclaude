@@ -210,20 +210,29 @@ compose_run_flags() {
     fi
     [ -t 1 ] && _add "-t"
 
-    # Working dir: bind-mount $PWD at same path and CD there. Refuse PWD=/
-    # outright — mounting / over the container's rootfs breaks /proc, /dev,
-    # /sys (Apple container errors with a fairly cryptic mount errno 30).
-    if [ "$PWD" = "/" ]; then
+    # Working dir: bind-mount the canonical PWD at same path and CD there.
+    # We resolve $PWD through symlinks (cd -P / pwd -P) so the path the
+    # container sees is independent of which alias the user typed. Without
+    # this, a project at /Users/me/.../foo accessed via a symlink shortcut
+    # like /Users/me/Google\ Drive/foo gets a different in-container CWD
+    # and a different project key — claude can't find sessions written
+    # under the canonical path's key.
+    local pwd_real
+    pwd_real="$(cd -P "$PWD" 2>/dev/null && pwd -P)" || pwd_real="$PWD"
+
+    # Refuse PWD=/ outright — mounting / over the container's rootfs
+    # breaks /proc, /dev, /sys (Apple container: cryptic mount errno 30).
+    if [ "$pwd_real" = "/" ]; then
         die "isoclaude refuses to run with PWD=/ (would overlay the container's rootfs); cd to a subdirectory first"
     fi
     # Refuse PWD containing ':' — it's the separator in `-v src:dst` so
     # the runtime would misparse the bind spec. (A future move to docker's
     # --mount type=bind,source=...,target=... syntax would lift this.)
-    case "$PWD" in
+    case "$pwd_real" in
         *:*) die "isoclaude doesn't support a working directory whose path contains ':' (would break -v src:dst parsing)" ;;
     esac
-    _add_mount "$PWD:$PWD"
-    _add "-w" "$PWD"
+    _add_mount "$pwd_real:$pwd_real"
+    _add "-w" "$pwd_real"
 
     # Create ~/.claude on demand. Without it the bind mount fails on
     # runtimes that don't auto-create the source ("path does not exist"
@@ -269,7 +278,10 @@ compose_run_flags() {
     # The container reads and writes its own file; the host is never
     # raced. The .isoclaude/local/ dir is created on demand even when
     # the user hasn't run `isoclaude init` — it's gitignored content.
-    local cfg_root="${PROJECT_ROOT:-$PWD}"
+    # Use the canonical PWD (resolved above) so the per-project copy
+    # lives at one consistent location, even if the user reaches the
+    # project via a symlink alias.
+    local cfg_root="${PROJECT_ROOT:-$pwd_real}"
     local proj_cfg="$cfg_root/.isoclaude/local/claude.json"
     if [ ! -f "$proj_cfg" ]; then
         mkdir -p "$cfg_root/.isoclaude/local" 2>/dev/null || true
