@@ -60,7 +60,11 @@ detect_runtime() {
 # longer match — but we still don't want to surface it as a "project" since
 # that's never what the user means.
 project_root() {
-    local dir="$PWD"
+    # Start from the canonical PWD so projects reached via a symlink
+    # alias still hash to the same key (everything downstream — plugins,
+    # claude.json copy, project Dockerfile, env/mounts — depends on this).
+    local dir
+    dir="$(cd -P "$PWD" 2>/dev/null && pwd -P)" || dir="$PWD"
     while :; do
         if [ "$dir" = "$HOME" ]; then
             return  # $HOME is reserved, not a project root
