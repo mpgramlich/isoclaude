@@ -366,6 +366,17 @@ case "$flags" in
     *) bad "host-plugins ro mount missing" "flags: $flags" ;;
 esac
 
+# Host's marketplaces dir also bound at its own absolute host path, ro,
+# so known_marketplaces.json absolute-path entries resolve for installs.
+mkdir -p "$HOME/.claude/plugins/marketplaces"  # ensure it exists for the mount
+compose_run_flags 2>/dev/null
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    *"-v $HOME/.claude/plugins/marketplaces:$HOME/.claude/plugins/marketplaces:ro"*)
+        ok "host marketplaces also mounted ro at the absolute host path" ;;
+    *) bad "marketplaces absolute-path mount missing" "flags: $flags" ;;
+esac
+
 # Without a project root: no plugin override; host plugins visible
 # via the parent ~/.claude mount as usual.
 PROJECT_ROOT=""
@@ -380,6 +391,11 @@ case "$flags" in
     *"host-plugins"*)
         bad "host-plugins mount should be project-scoped" ;;
     *) ok "no host-plugins mount when there's no project root" ;;
+esac
+case "$flags" in
+    *"$HOME/.claude/plugins/marketplaces:$HOME/.claude/plugins/marketplaces"*)
+        bad "marketplaces absolute-path mount should be project-scoped" ;;
+    *) ok "no marketplaces absolute-path mount when there's no project root" ;;
 esac
 
 #-----------------------------------------------------------------------

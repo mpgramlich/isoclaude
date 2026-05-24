@@ -371,6 +371,75 @@ case "$out" in
 esac
 
 #-----------------------------------------------------------------------
+section "_spawn_auth_refresher (background creds-refresh helper)"
+
+# Function should be a no-op on non-macOS (or where security CLI is
+# missing). We force the harness into "non-Darwin" mode by overriding
+# uname in $TMP/fakebin and confirm nothing is appended to RUN_FLAGS.
+mkdir -p "$TMP/fakebin"
+cat > "$TMP/fakebin/uname" <<'EOF'
+#!/usr/bin/env bash
+echo Linux
+EOF
+chmod +x "$TMP/fakebin/uname"
+
+RUN_FLAGS=()
+PATH="$TMP/fakebin:$PATH" _spawn_auth_refresher docker
+case "${RUN_FLAGS[*]}" in
+    *cidfile*) bad "added --cidfile despite non-Darwin (refresher should be inert)" ;;
+    *) ok "non-Darwin: no --cidfile added, no refresher spawned" ;;
+esac
+
+# ISOCLAUDE_AUTH_REFRESH=0 also opts out, even on Darwin.
+cat > "$TMP/fakebin/uname" <<'EOF'
+#!/usr/bin/env bash
+echo Darwin
+EOF
+chmod +x "$TMP/fakebin/uname"
+RUN_FLAGS=()
+PATH="$TMP/fakebin:$PATH" ISOCLAUDE_AUTH_REFRESH=0 _spawn_auth_refresher docker
+case "${RUN_FLAGS[*]}" in
+    *cidfile*) bad "ISOCLAUDE_AUTH_REFRESH=0 should disable the refresher" ;;
+    *) ok "ISOCLAUDE_AUTH_REFRESH=0 disables the refresher" ;;
+esac
+
+# On Darwin with the security CLI available, the helper SHOULD add a
+# --cidfile flag and background a process. Use a fake security so the
+# refresh helper's eventual _macos_auth_refresh call doesn't touch the
+# real keychain. Use a tiny interval so the helper loop fires once,
+# observes a "gone" container quickly, and exits cleanly.
+cat > "$TMP/fakebin/security" <<'EOF'
+#!/usr/bin/env bash
+exit 1  # pretend keychain has nothing → _macos_auth_refresh returns 1
+EOF
+chmod +x "$TMP/fakebin/security"
+
+RUN_FLAGS=()
+ISOCLAUDE_AUTH_REFRESH=1 ISOCLAUDE_REFRESH_INTERVAL_SEC=1 \
+    PATH="$TMP/fakebin:$PATH" _spawn_auth_refresher docker
+
+# The flag should have been added.
+case "${RUN_FLAGS[*]}" in
+    *--cidfile*) ok "Darwin + ISOCLAUDE_AUTH_REFRESH=1: --cidfile added to run flags" ;;
+    *) bad "no --cidfile added" "flags: ${RUN_FLAGS[*]}" ;;
+esac
+
+# The cidfile path should look right (tmp + isoclaude-cid prefix).
+cidfile=""
+for f in "${RUN_FLAGS[@]}"; do
+    case "$f" in
+        */isoclaude-cid-*) cidfile="$f"; break ;;
+    esac
+done
+[ -n "$cidfile" ] && ok "cidfile path follows the expected pattern: $cidfile" \
+                  || bad "no cidfile-looking entry in RUN_FLAGS"
+
+# Bgproc-cleanup: the helper waits 30s for the cidfile to appear; if it
+# never does, it exits silently. We don't want to leave anything dangling,
+# so explicitly clean any stray file.
+rm -f "$cidfile"
+
+#-----------------------------------------------------------------------
 section "End-to-end main() with mocks"
 
 # Reset state for an end-to-end pass.

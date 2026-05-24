@@ -187,7 +187,12 @@ plugin set:
 
 As a reference, the host's plugins are also re-mounted **read-only** at
 `~/.claude/host-plugins` inside the container — useful when you want to
-copy a plugin in from your host setup:
+copy a plugin in from your host setup. Additionally, host's
+`plugins/marketplaces` is re-mounted at its **absolute host path** (e.g.
+`/Users/<you>/.claude/plugins/marketplaces`) so claude's
+`known_marketplaces.json` entries (which record absolute host paths)
+resolve, and `/plugin install` succeeds even though installed plugins
+themselves go to the per-project store:
 
 ```sh
 # inside the sandbox
