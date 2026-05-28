@@ -11,6 +11,20 @@
 
 set -e
 
+# Run usermod and silence the one known-harmless error — "Failed to
+# change ownership of the home directory" — that trixie's usermod emits
+# when its recursive chown_tree hits our read-only bind mounts
+# (.gitconfig, .ssh, .claude/host-plugins). The passwd update is already
+# committed by that point; our explicit chown below handles the
+# writable parts. Other usermod errors still surface.
+_usermod_quiet() {
+    err=$(usermod "$@" 2>&1 >/dev/null) || true
+    case "$err" in
+        ""|*"Failed to change ownership of the home directory"*) ;;
+        *) printf '%s\n' "$err" >&2 ;;
+    esac
+}
+
 remap_gid() {
     target="$1"
     [ -n "$target" ] && [ "$target" != "$(id -g claude)" ] || return 0
@@ -18,7 +32,7 @@ remap_gid() {
         # A group with this GID already exists (common: HOST_GID=20 is
         # macOS staff but also debian's dialout). Reassign claude to that
         # group as its primary rather than renaming the existing group.
-        usermod -g "$target" claude
+        _usermod_quiet -g "$target" claude
     else
         groupmod -g "$target" claude
     fi
@@ -32,7 +46,7 @@ remap_uid() {
         echo "isoclaude-entrypoint: HOST_UID=$target collides with existing container user" >&2
         exit 1
     fi
-    usermod -u "$target" claude
+    _usermod_quiet -u "$target" claude
 }
 
 remap_gid "${HOST_GID:-${HOST_UID:-}}"

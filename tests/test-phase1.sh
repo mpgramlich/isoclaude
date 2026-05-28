@@ -47,9 +47,10 @@ fi
 section "entrypoint.sh — required behavior"
 
 ep=image/entrypoint.sh
-grep -q 'usermod -u'                        "$ep"  && ok "usermod -u runs"   || bad "missing usermod -u"
+grep -q '\-u "\$target" claude'             "$ep"  && ok "remap_uid runs usermod -u"   || bad "missing usermod -u"
 grep -q 'groupmod -g'                       "$ep"  && ok "groupmod -g runs"  || bad "missing groupmod -g"
-grep -q 'usermod -g'                        "$ep"  && ok "handles GID collisions via usermod -g" || bad "no GID-collision handling"
+grep -q '\-g "\$target" claude'             "$ep"  && ok "handles GID collisions via usermod -g" || bad "no GID-collision handling"
+grep -q 'Failed to change ownership'        "$ep"  && ok "filters known-harmless usermod chown_tree error" || bad "no filter for usermod chown noise"
 grep -q 'getent group'                      "$ep"  && ok "probes existing groups before remap" || bad "missing getent group probe"
 grep -q 'getent passwd'                     "$ep"  && ok "probes existing users before UID remap" || bad "missing getent passwd probe"
 grep -q 'exec gosu claude'                  "$ep"  && ok "exec gosu drops privs" || bad "missing exec gosu"
