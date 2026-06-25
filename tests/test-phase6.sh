@@ -726,5 +726,124 @@ for tok in "--publish" ".isoclaude/ports"; do
 done
 
 #-----------------------------------------------------------------------
+#-----------------------------------------------------------------------
+section "Resource caps (--memory / -m / --cpus + env)"
+
+# CLI --memory / -m: short and long forms.
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER -m 4g 2>/dev/null | tail -1)
+case "$out" in
+    *"-m 4g"*) ok "-m 4g passes through" ;;
+    *) bad "-m" "got: $out" ;;
+esac
+
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER --memory 8g 2>/dev/null | tail -1)
+case "$out" in
+    *"-m 8g"*) ok "--memory 8g passes through" ;;
+    *) bad "--memory" "got: $out" ;;
+esac
+
+# = forms.
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER --memory=512m 2>/dev/null | tail -1)
+case "$out" in
+    *"-m 512m"*) ok "--memory=512m form" ;;
+    *) bad "--memory=" "got: $out" ;;
+esac
+
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER -m=1g 2>/dev/null | tail -1)
+case "$out" in
+    *"-m 1g"*) ok "-m=1g form" ;;
+    *) bad "-m=" "got: $out" ;;
+esac
+
+# --cpus only has long form (docker parity).
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER --cpus 2 2>/dev/null | tail -1)
+case "$out" in
+    *"--cpus 2"*) ok "--cpus 2 passes through" ;;
+    *) bad "--cpus" "got: $out" ;;
+esac
+
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER --cpus 0.5 2>/dev/null | tail -1)
+case "$out" in
+    *"--cpus 0.5"*) ok "--cpus 0.5 (fractional) passes through" ;;
+    *) bad "fractional cpus" "got: $out" ;;
+esac
+
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER --cpus=4 2>/dev/null | tail -1)
+case "$out" in
+    *"--cpus 4"*) ok "--cpus=4 form" ;;
+    *) bad "--cpus=" "got: $out" ;;
+esac
+
+# Env vars.
+reset
+out=$(cd "$TMP/proj" && ISOCLAUDE_MEMORY=6g ISOCLAUDE_CPUS=3 RUN_WRAPPER 2>/dev/null | tail -1)
+case "$out" in
+    *"-m 6g"*"--cpus 3"*|*"--cpus 3"*"-m 6g"*) ok "ISOCLAUDE_MEMORY + ISOCLAUDE_CPUS env vars" ;;
+    *) bad "env vars" "got: $out" ;;
+esac
+
+# CLI overrides env.
+reset
+out=$(cd "$TMP/proj" && ISOCLAUDE_MEMORY=2g RUN_WRAPPER -m 16g 2>/dev/null | tail -1)
+case "$out" in
+    *"-m 16g"*) ok "CLI -m overrides ISOCLAUDE_MEMORY env" ;;
+    *) bad "CLI override" "got: $out" ;;
+esac
+case "$out" in
+    *"-m 2g"*) bad "env value leaked alongside CLI" "got: $out" ;;
+    *) ok "env value not double-emitted" ;;
+esac
+
+# Control: no flag, no env → no -m / --cpus at all.
+reset
+unset ISOCLAUDE_MEMORY ISOCLAUDE_CPUS
+out=$(cd "$TMP/proj" && RUN_WRAPPER 2>/dev/null | tail -1)
+case "$out" in
+    *"-m "*) bad "emitted -m without ask" "got: $out" ;;
+    *"--cpus"*) bad "emitted --cpus without ask" "got: $out" ;;
+    *) ok "no -m / --cpus by default" ;;
+esac
+
+# Missing arg → die.
+reset
+out=$( { cd "$TMP/proj" && RUN_WRAPPER -m; } 2>&1 | tail -1 || true)
+case "$out" in
+    *"requires an argument"*) ok "-m without arg errors out" ;;
+    *) bad "-m missing arg" "got: $out" ;;
+esac
+
+reset
+out=$( { cd "$TMP/proj" && RUN_WRAPPER --cpus; } 2>&1 | tail -1 || true)
+case "$out" in
+    *"requires an argument"*) ok "--cpus without arg errors out" ;;
+    *) bad "--cpus missing arg" "got: $out" ;;
+esac
+
+# --memory after `--` is a literal arg, not consumed.
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER -- --memory 9g 2>/dev/null | tail -1)
+case "$out" in
+    *"-m 9g"*) bad "--memory after -- was consumed" "got: $out" ;;
+    *claude*--memory*) ok "--memory after -- passes through to claude" ;;
+    *) bad "after-dashdash" "got: $out" ;;
+esac
+
+# Help text mentions both.
+out="$(cmd_help)"
+for tok in "--memory" "--cpus" "ISOCLAUDE_MEMORY" "ISOCLAUDE_CPUS"; do
+    case "$out" in
+        *"$tok"*) ok "help mentions '$tok'" ;;
+        *) bad "help missing '$tok'" ;;
+    esac
+done
+
+#-----------------------------------------------------------------------
 printf '\n\033[1mPhase 6: %d passed, %d failed\033[0m\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -487,6 +487,15 @@ compose_run_flags() {
             _add_publish_spec "$p" "CLI"
         done
     fi
+
+    # Resource caps. Same docker-style syntax across runtimes — pass
+    # through verbatim. Empty → don't emit (let runtime use its default).
+    if [ -n "${MEMORY:-}" ]; then
+        _add "-m" "$MEMORY"
+    fi
+    if [ -n "${CPUS:-}" ]; then
+        _add "--cpus" "$CPUS"
+    fi
 }
 
 # Read a KEY=VALUE env file and add each entry as `-e KEY=VALUE`. We parse
@@ -1573,6 +1582,13 @@ GLOBAL FLAGS
                             container — for an existing persistent
                             container, `isoclaude rm` first, then run
                             again with --offline.
+    --memory, -m N[K|M|G]   Memory cap for the container (docker syntax:
+                            "4g", "512m", raw bytes). Only effective on
+                            container CREATE; existing persistent
+                            containers keep their original limit until
+                            `isoclaude rm`.
+    --cpus N                CPU cap (docker syntax: "2", "0.5", "1.5").
+                            Same create-only caveat as --memory.
 
 ENVIRONMENT
     ISOCLAUDE_HOME           Override the install dir (default: ~/.isoclaude).
@@ -1582,6 +1598,8 @@ ENVIRONMENT
     ISOCLAUDE_YOLO=1         Same as passing --yolo on every invocation.
     ISOCLAUDE_KEEP=1         Same as passing --keep on every invocation.
     ISOCLAUDE_OFFLINE=1      Same as passing --offline on every invocation.
+    ISOCLAUDE_MEMORY         Default for --memory (e.g. "8g").
+    ISOCLAUDE_CPUS           Default for --cpus (e.g. "4").
 EOF
 }
 
@@ -1597,9 +1615,21 @@ main() {
     #   --no-keep            → KEEP=0 force-ephemeral (useful when a
     #                          persistent container exists but the user
     #                          wants a one-off clean run)
+    #   --offline / -o       → OFFLINE=1 (cut the container off from the
+    #                          internet — host-only / no-DNS on Apple
+    #                          container; --network none on docker/podman)
+    #   --publish / -p SPEC  → append SPEC to PUBLISH (repeatable). Each
+    #                          spec follows the runtime's -p syntax:
+    #                          [host-ip:]host-port:container-port[/proto].
+    #                          Bare numeric ("8080") is shorthand for
+    #                          host:container of the same number.
+    #   --memory / -m N      → MEMORY=N (docker syntax: 4g, 512m, bytes).
+    #   --cpus N             → CPUS=N (docker syntax: 2, 0.5, 1.5).
     YOLO="${ISOCLAUDE_YOLO:-0}"
     KEEP="${ISOCLAUDE_KEEP:-0}"
     OFFLINE="${ISOCLAUDE_OFFLINE:-0}"
+    MEMORY="${ISOCLAUDE_MEMORY:-}"
+    CPUS="${ISOCLAUDE_CPUS:-}"
     PUBLISH=()
     local args=() seen_dashdash=0 i=1
     while [ "$i" -le "$#" ]; do
@@ -1619,6 +1649,23 @@ main() {
                     i=$((i+1)); continue ;;
                 --publish=*)  PUBLISH+=("${arg#--publish=}"); i=$((i+1)); continue ;;
                 -p=*)         PUBLISH+=("${arg#-p=}"); i=$((i+1)); continue ;;
+                --memory|-m)
+                    i=$((i+1))
+                    if [ "$i" -gt "$#" ]; then
+                        die "$arg requires an argument"
+                    fi
+                    MEMORY="${!i}"
+                    i=$((i+1)); continue ;;
+                --memory=*)   MEMORY="${arg#--memory=}"; i=$((i+1)); continue ;;
+                -m=*)         MEMORY="${arg#-m=}"; i=$((i+1)); continue ;;
+                --cpus)
+                    i=$((i+1))
+                    if [ "$i" -gt "$#" ]; then
+                        die "$arg requires an argument"
+                    fi
+                    CPUS="${!i}"
+                    i=$((i+1)); continue ;;
+                --cpus=*)     CPUS="${arg#--cpus=}"; i=$((i+1)); continue ;;
                 --)           seen_dashdash=1 ;;  # fall through, preserve --
             esac
         fi
