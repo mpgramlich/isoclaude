@@ -466,14 +466,26 @@ compose_run_flags() {
     _add "-e" "TERM"
     _add "-e" "COLORTERM"
 
-    # Project-level overlays: env vars and extra mounts. local/ overrides
-    # the committed copy by being listed second (docker takes later -e).
+    # Project-level overlays: env vars, mounts, published ports.
+    # local/ overrides the committed copy by being listed second (docker
+    # takes later -e). Ports just append — both files contribute.
     if [ -n "${PROJECT_ROOT:-}" ]; then
         local d="$PROJECT_ROOT/.isoclaude"
         _add_project_env "$d/env"
         _add_project_env "$d/local/env"
         _add_project_mounts "$d/mounts"
         _add_project_mounts "$d/local/mounts"
+        _add_project_ports "$d/ports"
+        _add_project_ports "$d/local/ports"
+    fi
+
+    # CLI --publish/-p flags last, so they win over project-file specs
+    # when a runtime treats duplicate -p as last-wins.
+    if [ "${#PUBLISH[@]}" -gt 0 ]; then
+        local p
+        for p in "${PUBLISH[@]}"; do
+            _add_publish_spec "$p" "CLI"
+        done
     fi
 }
 
@@ -503,6 +515,55 @@ _add_project_env() {
                 warn "$file: skipping line without '=': $line"
                 continue ;;
         esac
+    done < "$file"
+}
+
+# Validate and normalize a publish spec, then append it as `-p <spec>` to
+# RUN_FLAGS. Accepts the runtime's full syntax —
+#     [host-ip:]host-port:container-port[/protocol]
+# — plus a shorthand of a bare port number, expanded to "N:N". Warns and
+# skips on anything that doesn't look like a port spec, so a junk line in
+# `.isoclaude/ports` doesn't blow up the whole launch with a runtime
+# error from cryptic-port-parser-land.
+_add_publish_spec() {
+    local spec="$1" src="${2:-CLI}"
+    local expanded="$spec"   # NB: same-line `local a=$1 b=$a` doesn't
+                             # see $a in bash. Keep this on its own line.
+    case "$spec" in
+        ""|"#"*) return 0 ;;
+    esac
+    # Shorthand: "8080" → "8080:8080", "8080/tcp" → "8080:8080/tcp".
+    # Triggers only when there's no ':' AND the part before any '/' is
+    # all digits. Avoids touching specs that already look correct.
+    case "$spec" in
+        *:*) : ;;  # already has a host:container split
+        *)
+            local n="${spec%%/*}" proto=""
+            case "$spec" in *"/"*) proto="/${spec#*/}" ;; esac
+            case "$n" in
+                ""|*[!0-9]*) ;;  # not a bare port
+                *) expanded="$n:$n$proto" ;;
+            esac
+            ;;
+    esac
+    # After expansion we expect at least one ':'.
+    case "$expanded" in
+        *:*) _add "-p" "$expanded" ;;
+        *)   warn "$src: skipping invalid publish spec: $spec" ;;
+    esac
+}
+
+# Read a ports file, one spec per line; same comment/blank rules as
+# .isoclaude/mounts. Each non-empty line is forwarded to
+# _add_publish_spec, which handles shorthand and validation.
+_add_project_ports() {
+    local file="$1" line trimmed
+    [ -f "$file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        trimmed="${line#"${line%%[![:space:]]*}"}"
+        case "$trimmed" in ""|"#"*) continue ;; esac
+        _add_publish_spec "$trimmed" "$file"
     done < "$file"
 }
 
@@ -1498,6 +1559,13 @@ GLOBAL FLAGS
                             persistent container already exists for
                             this PWD. The persistent container is
                             untouched.
+    --publish, -p SPEC      Publish a port from the container to the
+                            host. SPEC follows the runtime's syntax:
+                            [host-ip:]host-port:container-port[/proto].
+                            Bare numeric ("8080") expands to "8080:8080".
+                            Repeatable. Recurring ports for a project
+                            can also go in .isoclaude/ports (one spec
+                            per line, # comments).
     --offline, -o           Cut the container off from the internet at
                             create time. Apple `container`: host-only
                             network + --no-dns. docker/podman: --network
@@ -1532,18 +1600,30 @@ main() {
     YOLO="${ISOCLAUDE_YOLO:-0}"
     KEEP="${ISOCLAUDE_KEEP:-0}"
     OFFLINE="${ISOCLAUDE_OFFLINE:-0}"
-    local args=() arg seen_dashdash=0
-    for arg in "$@"; do
+    PUBLISH=()
+    local args=() seen_dashdash=0 i=1
+    while [ "$i" -le "$#" ]; do
+        local arg="${!i}"
         if [ "$seen_dashdash" = 0 ]; then
             case "$arg" in
-                --yolo|-Y)    YOLO=1; continue ;;
-                --keep|-k)    KEEP=1; continue ;;
-                --no-keep)    KEEP=0; FORCE_EPHEMERAL=1; continue ;;
-                --offline|-o) OFFLINE=1; continue ;;
+                --yolo|-Y)    YOLO=1; i=$((i+1)); continue ;;
+                --keep|-k)    KEEP=1; i=$((i+1)); continue ;;
+                --no-keep)    KEEP=0; FORCE_EPHEMERAL=1; i=$((i+1)); continue ;;
+                --offline|-o) OFFLINE=1; i=$((i+1)); continue ;;
+                --publish|-p)
+                    i=$((i+1))
+                    if [ "$i" -gt "$#" ]; then
+                        die "$arg requires an argument"
+                    fi
+                    PUBLISH+=("${!i}")
+                    i=$((i+1)); continue ;;
+                --publish=*)  PUBLISH+=("${arg#--publish=}"); i=$((i+1)); continue ;;
+                -p=*)         PUBLISH+=("${arg#-p=}"); i=$((i+1)); continue ;;
                 --)           seen_dashdash=1 ;;  # fall through, preserve --
             esac
         fi
         args+=("$arg")
+        i=$((i+1))
     done
     set -- "${args[@]}"
 

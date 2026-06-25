@@ -579,5 +579,152 @@ for tok in "--offline" "ISOCLAUDE_OFFLINE"; do
 done
 
 #-----------------------------------------------------------------------
+#-----------------------------------------------------------------------
+section "Port publishing (--publish / -p / .isoclaude/ports)"
+
+# _add_publish_spec direct: full spec, untouched.
+reset
+RUN_FLAGS=()
+_add_publish_spec "8080:80" "CLI"
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    "-p 8080:80") ok "_add_publish_spec: full spec passes through" ;;
+    *) bad "full spec emission" "flags: $flags" ;;
+esac
+
+# _add_publish_spec direct: bare numeric → shorthand expansion.
+reset
+RUN_FLAGS=()
+_add_publish_spec "8080" "CLI"
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    "-p 8080:8080") ok "_add_publish_spec: bare port expands to N:N" ;;
+    *) bad "shorthand expansion" "flags: $flags" ;;
+esac
+
+# _add_publish_spec direct: bare-with-protocol shorthand.
+reset
+RUN_FLAGS=()
+_add_publish_spec "53/udp" "CLI"
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    "-p 53:53/udp") ok "_add_publish_spec: N/proto expands to N:N/proto" ;;
+    *) bad "proto shorthand" "flags: $flags" ;;
+esac
+
+# _add_publish_spec direct: full spec with host IP, untouched.
+reset
+RUN_FLAGS=()
+_add_publish_spec "127.0.0.1:8080:80" "CLI"
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    "-p 127.0.0.1:8080:80") ok "_add_publish_spec: host-ip spec preserved" ;;
+    *) bad "host-ip spec" "flags: $flags" ;;
+esac
+
+# Empty / comment lines short-circuit cleanly.
+reset
+RUN_FLAGS=()
+_add_publish_spec "" "CLI"
+_add_publish_spec "#comment" "CLI"
+[ "${#RUN_FLAGS[@]}" = 0 ] && ok "empty/comment specs produce no flags" \
+    || bad "empty/comment emitted" "flags: ${RUN_FLAGS[*]}"
+
+# Malformed spec → warn and skip (RUN_FLAGS untouched).
+reset
+RUN_FLAGS=()
+_add_publish_spec "garbage-no-colon" "CLI" 2>/dev/null
+[ "${#RUN_FLAGS[@]}" = 0 ] && ok "malformed spec is dropped" \
+    || bad "malformed spec was added" "flags: ${RUN_FLAGS[*]}"
+
+# .isoclaude/ports file: comments, blanks, shorthand all handled.
+reset
+mkdir -p "$TMP/proj/.isoclaude"
+cat > "$TMP/proj/.isoclaude/ports" <<'EOF'
+# vite dev
+5173
+
+8080:80
+53/udp
+EOF
+RUN_FLAGS=()
+_add_project_ports "$TMP/proj/.isoclaude/ports"
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    *"-p 5173:5173"*"-p 8080:80"*"-p 53:53/udp"*) ok ".isoclaude/ports: all three entries emitted in order" ;;
+    *) bad "ports file emission" "flags: $flags" ;;
+esac
+
+# Missing ports file is a clean no-op.
+reset
+RUN_FLAGS=()
+_add_project_ports "$TMP/proj/does-not-exist-ports" 2>/dev/null
+[ "${#RUN_FLAGS[@]}" = 0 ] && ok "missing ports file is a no-op" \
+    || bad "missing file emitted" "flags: ${RUN_FLAGS[*]}"
+
+# CLI --publish / -p (end-to-end via the subprocess wrapper).
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER --publish 8080 2>/dev/null | tail -1)
+case "$out" in
+    *"-p 8080:8080"*) ok "--publish 8080 (long, shorthand)" ;;
+    *) bad "--publish" "got: $out" ;;
+esac
+
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER -p 5173:5173 -p 9000:90 2>/dev/null | tail -1)
+case "$out" in
+    *"-p 5173:5173"*"-p 9000:90"*) ok "-p repeatable preserves order" ;;
+    *) bad "-p repeat" "got: $out" ;;
+esac
+
+# --publish= long form (= syntax).
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER --publish=4000:4000 2>/dev/null | tail -1)
+case "$out" in
+    *"-p 4000:4000"*) ok "--publish=SPEC form" ;;
+    *) bad "--publish=" "got: $out" ;;
+esac
+
+# Missing argument to --publish should die with a clear error. We
+# `|| true` because the wrapper exits nonzero, and set -e would
+# otherwise abort the whole test suite.
+reset
+out=$( { cd "$TMP/proj" && RUN_WRAPPER --publish; } 2>&1 | tail -1 || true)
+case "$out" in
+    *"requires an argument"*) ok "--publish without arg errors out" ;;
+    *) bad "--publish missing arg" "got: $out" ;;
+esac
+
+# --publish after `--` is a literal claude arg, NOT a wrapper flag.
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER -- --publish foo 2>/dev/null | tail -1)
+case "$out" in
+    *"-p "*) bad "--publish after -- was consumed" "got: $out" ;;
+    *claude*--publish*foo*) ok "--publish after -- passes through" ;;
+    *) bad "after-dashdash" "got: $out" ;;
+esac
+
+# Project ports file + CLI --publish: BOTH appear, CLI last (so a
+# duplicate-port -p from the CLI overrides the file under last-wins
+# runtime semantics).
+reset
+mkdir -p "$TMP/proj/.isoclaude"
+echo "8000" > "$TMP/proj/.isoclaude/ports"
+out=$(cd "$TMP/proj" && RUN_WRAPPER -p 9999:99 2>/dev/null | tail -1)
+case "$out" in
+    *"-p 8000:8000"*"-p 9999:99"*) ok "project ports file + CLI -p both emitted, file first" ;;
+    *) bad "file + CLI combo order" "got: $out" ;;
+esac
+
+# Help text mentions --publish and .isoclaude/ports.
+out="$(cmd_help)"
+for tok in "--publish" ".isoclaude/ports"; do
+    case "$out" in
+        *"$tok"*) ok "help mentions '$tok'" ;;
+        *) bad "help missing '$tok'" ;;
+    esac
+done
+
+#-----------------------------------------------------------------------
 printf '\n\033[1mPhase 6: %d passed, %d failed\033[0m\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
