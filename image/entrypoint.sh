@@ -60,7 +60,21 @@ if [ -n "${HOST_UID:-}" ]; then
         ! -name .claude \
         ! -name .gitconfig \
         ! -name .ssh \
+        ! -name .isoclaude \
         -exec chown -R "$HOST_UID:${HOST_GID:-$HOST_UID}" {} +
+fi
+
+# Persisted-mode args override. When `isoclaude --keep` creates a
+# container, it bind-mounts a host file at this path containing the
+# argv to use. Each subsequent `isoclaude` in the same PWD rewrites
+# that file before `container start`, so the restarted container picks
+# up fresh args (different --resume id, --dangerously-skip-permissions,
+# etc.) without being recreated. Skipped when the file isn't mounted,
+# so ephemeral (--rm) runs are unaffected.
+ARGS_FILE=/home/claude/.isoclaude/cmd
+if [ -r "$ARGS_FILE" ]; then
+    # shellcheck disable=SC2046,SC2086
+    eval "set -- $(cat "$ARGS_FILE")"
 fi
 
 exec gosu claude "$@"

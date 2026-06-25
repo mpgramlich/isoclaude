@@ -198,9 +198,94 @@ ensure_base_image() {
 _add()        { RUN_FLAGS=( "${RUN_FLAGS[@]}" "$@" ); }
 _add_mount()  { _add "-v" "$1"; }
 
+# Short stable hash of a string. Used to derive container names from
+# the canonical PWD and image tag. shasum is on every macOS install.
+_short_hash() {
+    printf '%s' "$1" | shasum -a 256 | cut -c1-"$2"
+}
+
+# Compute the deterministic persistent-container name for the current
+# PWD + image. Once a container is created with --keep, every future
+# invocation in the same PWD against the same image looks it up here.
+# Image-tag hash is included so an image rebuild (claude version pin
+# bump, project Dockerfile change) orphans the old container instead
+# of silently reusing one with stale rootfs.
+_container_name() {
+    local pwd_real img
+    pwd_real="$(cd -P "$PWD" 2>/dev/null && pwd -P)" || pwd_real="$PWD"
+    img="${RUN_IMAGE:-$ISOCLAUDE_BASE_IMAGE}"
+    printf 'isoclaude-%s-%s\n' \
+        "$(_short_hash "$pwd_real" 12)" \
+        "$(_short_hash "$img" 8)"
+}
+
+# Probe a container's lifecycle state. Echoes "running", "stopped", or
+# "" (missing). Apple `container` and docker both emit JSON from
+# `inspect`; we walk it defensively because the shape isn't identical
+# across runtimes.
+_container_state() {
+    local runtime="$1" name="$2"
+    # Top-level `set -eo pipefail` makes a failing `inspect` (exit 1 when
+    # the container is missing) propagate out of the pipe and kill the
+    # script. Localize that with `|| true` so missing → empty output.
+    { "$runtime" inspect "$name" 2>/dev/null || true; } | python3 -c '
+import sys, json
+try: data = json.load(sys.stdin)
+except Exception: sys.exit(0)
+def status_of(obj):
+    if not isinstance(obj, dict): return None
+    s = obj.get("Status") or obj.get("status")
+    if isinstance(s, str): return s
+    state = obj.get("State") or obj.get("state")
+    if isinstance(state, dict):
+        for k in ("Status", "status"):
+            if isinstance(state.get(k), str): return state[k]
+    if isinstance(state, str): return state
+    return None
+def walk(o):
+    if isinstance(o, dict):
+        s = status_of(o)
+        if s: return s
+        for v in o.values():
+            r = walk(v)
+            if r: return r
+    elif isinstance(o, list):
+        for v in o:
+            r = walk(v)
+            if r: return r
+v = walk(data)
+if v:
+    v = v.lower()
+    if v in ("running", "up"): print("running")
+    elif v in ("stopped", "exited", "created", "dead", "configured"): print("stopped")
+    else: print(v)
+' 2>/dev/null
+}
+
+# Write the argv that the persisted container should run on its next
+# start into the host-side cmd file. Each token is shell-quoted with
+# printf %q so the entrypoint's eval reconstructs the original argv
+# faithfully, including paths with spaces and embedded quotes.
+_write_persist_cmd() {
+    local file="$1"; shift
+    local quoted=""
+    while [ "$#" -gt 0 ]; do
+        quoted="$quoted $(printf '%q' "$1")"
+        shift
+    done
+    # Trim the leading space; harmless to eval but ugly.
+    quoted="${quoted# }"
+    printf '%s\n' "$quoted" > "$file"
+}
+
 compose_run_flags() {
     RUN_FLAGS=()
-    _add "--rm"
+    # --rm only on ephemeral runs; persistent containers stay around so
+    # their writable layer (apt installs, MCP server state, /tmp, shell
+    # history) survives between isoclaude invocations.
+    if [ "${KEEP:-0}" != "1" ]; then
+        _add "--rm"
+    fi
     # Pass -i when stdin actually has something to forward — terminal,
     # pipe, or a non-empty regular file (heredoc). Without this gate,
     # claude inside waits ~3s for stdin data that will never come when
@@ -302,6 +387,17 @@ compose_run_flags() {
     _add_mount "$proj_cfg:/home/claude/.claude.json"
     _macos_auth_check
 
+    # Persisted-mode argv file. Mounted ro from the host; rewritten by
+    # the wrapper before each `container start`. Only relevant when
+    # --keep is in effect — for ephemeral runs we skip the mount and
+    # the entrypoint falls through to "$@" as before.
+    if [ "${KEEP:-0}" = "1" ]; then
+        local cmd_file="$cfg_root/.isoclaude/local/cmd"
+        mkdir -p "$cfg_root/.isoclaude/local" 2>/dev/null || true
+        [ -f "$cmd_file" ] || : > "$cmd_file"
+        _add_mount "$cmd_file:/home/claude/.isoclaude/cmd:ro"
+    fi
+
     # Git config (ro).
     if [ -f "$HOME/.gitconfig" ]; then
         _add_mount "$HOME/.gitconfig:/home/claude/.gitconfig:ro"
@@ -395,58 +491,148 @@ _add_project_mounts() {
 # Exec the given entry command (claude, bash, ...) inside the sandbox.
 # Uses RUN_IMAGE (the project overlay if one exists, otherwise the base).
 # Honors ISOCLAUDE_DRY_RUN to print the runtime invocation without execing.
+#
+# Lifecycle dispatch:
+#   container exists, running   → exec (attach a new claude/bash)
+#   container exists, stopped   → start -ai (resume original entrypoint)
+#   container missing, KEEP=1   → run --name (no --rm, persistent)
+#   container missing, KEEP=0   → run --rm (ephemeral, original behavior)
+#
+# Once a container has been created with --keep in a PWD, every future
+# invocation auto-resumes it. Pass --no-keep to force one-off ephemeral.
 _exec_in_sandbox() {
     local runtime="$1" entry="$2"; shift 2
+    local image cname state
+
+    image="${RUN_IMAGE:-$ISOCLAUDE_BASE_IMAGE}"
+    cname="$(_container_name)"
+    state=""
+    if [ "${FORCE_EPHEMERAL:-0}" != "1" ]; then
+        state="$(_container_state "$runtime" "$cname")"
+    fi
+
+    # If a persistent container already exists for this PWD+image, the
+    # KEEP flag is sticky regardless of whether --keep was passed this
+    # invocation. The user's expectation: once persistent, always
+    # persistent until isoclaude rm.
+    if [ -n "$state" ]; then
+        KEEP=1
+    fi
+
     compose_run_flags
-    local image="${RUN_IMAGE:-$ISOCLAUDE_BASE_IMAGE}"
+
+    # ---- EXEC into a running container -----------------------------------
+    if [ "$state" = "running" ]; then
+        local pwd_real
+        pwd_real="$(cd -P "$PWD" 2>/dev/null && pwd -P)" || pwd_real="$PWD"
+        local exec_flags=( -u claude -w "$pwd_real" )
+        if [ -t 0 ] || [ -p /dev/stdin ] || [ -s /dev/stdin ]; then
+            exec_flags+=( -i )
+        fi
+        [ -t 1 ] && exec_flags+=( -t )
+        if [ -n "${ISOCLAUDE_DRY_RUN:-}" ]; then
+            printf '%s exec' "$runtime"
+            printf ' %q' "${exec_flags[@]}" "$cname" "$entry" "$@"
+            printf '\n'
+            return 0
+        fi
+        exec "$runtime" exec "${exec_flags[@]}" "$cname" "$entry" "$@"
+    fi
+
+    # ---- START a stopped container ---------------------------------------
+    if [ "$state" = "stopped" ]; then
+        # Write fresh argv into the persisted cmd file so the entrypoint
+        # picks up new --resume ids / yolo / etc. when it re-runs.
+        local cfg_root="${PROJECT_ROOT:-$PWD}"
+        local cmd_file="$cfg_root/.isoclaude/local/cmd"
+        mkdir -p "$cfg_root/.isoclaude/local" 2>/dev/null || true
+        _write_persist_cmd "$cmd_file" "$entry" "$@"
+
+        if [ -n "${ISOCLAUDE_DRY_RUN:-}" ]; then
+            printf '%s start -a -i %q\n' "$runtime" "$cname"
+            return 0
+        fi
+        _spawn_auth_refresher "$runtime" "$cname"
+        exec "$runtime" start -a -i "$cname"
+    fi
+
+    # ---- CREATE a fresh container (run) ----------------------------------
+    if [ "${KEEP:-0}" = "1" ]; then
+        # Persistent: pin the name, drop --rm (compose_run_flags already
+        # did), and feed argv via the cmd file rather than CMD so future
+        # `container start`s can pick up updated args.
+        _add "--name" "$cname"
+        local cfg_root="${PROJECT_ROOT:-$PWD}"
+        local cmd_file="$cfg_root/.isoclaude/local/cmd"
+        _write_persist_cmd "$cmd_file" "$entry" "$@"
+
+        if [ -n "${ISOCLAUDE_DRY_RUN:-}" ]; then
+            printf '%s' "$runtime run"
+            printf ' %q' "${RUN_FLAGS[@]}" "$image"
+            printf '\n'
+            return 0
+        fi
+        _spawn_auth_refresher "$runtime" "$cname"
+        # No CMD args here — entrypoint reads them from the bind-mounted
+        # cmd file and execs claude with them.
+        exec "$runtime" run "${RUN_FLAGS[@]}" "$image"
+    fi
+
+    # Ephemeral: original behavior, --rm, args via CMD.
     if [ -n "${ISOCLAUDE_DRY_RUN:-}" ]; then
         printf '%s' "$runtime run"
         printf ' %q' "${RUN_FLAGS[@]}" "$image" "$entry" "$@"
         printf '\n'
         return 0
     fi
-    # Spawn a background helper that keeps the in-container
-    # credentials file in sync with the macOS keychain while this
-    # container is alive. Each new claude process inside reads creds
-    # fresh from the file, so periodic refreshes propagate.
     _spawn_auth_refresher "$runtime"
     exec "$runtime" run "${RUN_FLAGS[@]}" "$image" "$entry" "$@"
 }
 
 # Spawn a detached background process that periodically re-runs
 # _macos_auth_refresh while the container we're about to launch is alive.
-# Uses --cidfile so the helper can identify the container and exit when
-# it stops. No-op on non-macOS (no keychain to sync from). The helper
-# survives our upcoming `exec` because it's already its own process.
+# Two modes:
+#   _spawn_auth_refresher "$runtime"          → uses --cidfile (run path,
+#                                               where the container has
+#                                               no pre-known name)
+#   _spawn_auth_refresher "$runtime" "$name"  → uses an explicit name
+#                                               (start path, where we
+#                                               already know it)
+# No-op on non-macOS (no keychain to sync from). The helper survives our
+# upcoming `exec` because it's already its own process.
 _spawn_auth_refresher() {
-    local runtime="$1"
+    local runtime="$1" known_name="${2:-}"
     [ "$(uname 2>/dev/null)" = "Darwin" ] || return 0
     command -v security >/dev/null 2>&1   || return 0
     # Skip when the env explicitly turns it off — useful for tests and
     # for users who want the old startup-only sync behavior.
     [ "${ISOCLAUDE_AUTH_REFRESH:-1}" = "0" ] && return 0
 
-    local cidfile interval logfile
-    cidfile="${TMPDIR:-/tmp}/isoclaude-cid-$$-$RANDOM"
+    local cidfile="" interval logfile
     interval="${ISOCLAUDE_REFRESH_INTERVAL_SEC:-1800}"   # 30 min default
     logfile="${ISOCLAUDE_REFRESH_LOG:-/tmp/isoclaude-refresher.log}"
-    rm -f "$cidfile"
-    _add "--cidfile" "$cidfile"
+    if [ -z "$known_name" ]; then
+        cidfile="${TMPDIR:-/tmp}/isoclaude-cid-$$-$RANDOM"
+        rm -f "$cidfile"
+        _add "--cidfile" "$cidfile"
+    fi
 
     # The helper runs the existing _macos_auth_refresh function, which is
     # already defined in this shell. Subshells inherit functions, so the
     # backgrounded `(...)` block can call it.
     (
-        # Wait briefly for the container to start (cidfile populated).
-        local _i
-        for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
-                  21 22 23 24 25 26 27 28 29 30; do
-            [ -s "$cidfile" ] && break
-            sleep 1
-        done
-        local cid
-        cid="$(cat "$cidfile" 2>/dev/null)" || { rm -f "$cidfile"; exit 0; }
-        [ -z "$cid" ] && { rm -f "$cidfile"; exit 0; }
+        local cid="$known_name"
+        if [ -z "$cid" ]; then
+            # Wait briefly for the container to start (cidfile populated).
+            local _i
+            for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+                      21 22 23 24 25 26 27 28 29 30; do
+                [ -s "$cidfile" ] && break
+                sleep 1
+            done
+            cid="$(cat "$cidfile" 2>/dev/null)" || { rm -f "$cidfile"; exit 0; }
+            [ -z "$cid" ] && { rm -f "$cidfile"; exit 0; }
+        fi
 
         printf '[%s] refresher attached to %s (interval=%ds)\n' \
                "$(date -u +%FT%TZ)" "$cid" "$interval" >>"$logfile" 2>/dev/null
@@ -461,7 +647,7 @@ _spawn_auth_refresher() {
 
         printf '[%s] refresher exiting; container %s gone\n' \
                "$(date -u +%FT%TZ)" "$cid" >>"$logfile" 2>/dev/null
-        rm -f "$cidfile"
+        [ -n "$cidfile" ] && rm -f "$cidfile"
     ) </dev/null >/dev/null 2>&1 &
     disown 2>/dev/null || true
 }
@@ -850,6 +1036,121 @@ cmd_prune() {
     log "pruned $removed project image(s), kept $kept"
 }
 
+# List persistent isoclaude containers for the current PWD. Matches by
+# the PWD-hash prefix (image-tag suffix may vary across rebuilds), so
+# orphans from older image tags are still surfaced.
+_list_pwd_containers() {
+    local runtime="$1" pwd_real prefix
+    pwd_real="$(cd -P "$PWD" 2>/dev/null && pwd -P)" || pwd_real="$PWD"
+    prefix="isoclaude-$(_short_hash "$pwd_real" 12)-"
+    "$runtime" list -a --format json 2>/dev/null | python3 -c '
+import sys, json
+try: data = json.load(sys.stdin)
+except Exception: sys.exit(0)
+prefix = sys.argv[1] if len(sys.argv) > 1 else ""
+def names(o):
+    out = []
+    if isinstance(o, dict):
+        for k in ("Name", "name", "ID", "id", "Names", "names"):
+            v = o.get(k)
+            if isinstance(v, str): out.append(v)
+            elif isinstance(v, list):
+                for x in v:
+                    if isinstance(x, str): out.append(x)
+        for v in o.values(): out += names(v)
+    elif isinstance(o, list):
+        for v in o: out += names(v)
+    return out
+seen = set()
+for n in names(data):
+    n = n.lstrip("/")
+    if n.startswith(prefix) and n not in seen:
+        seen.add(n); print(n)
+' "$prefix" 2>/dev/null
+}
+
+cmd_stop() {
+    local runtime
+    runtime="$(detect_runtime)"
+    local stopped=0 name
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        if "$runtime" stop "$name" >/dev/null 2>&1; then
+            log "stopped $name"
+            stopped=$((stopped + 1))
+        fi
+    done <<<"$(_list_pwd_containers "$runtime")"
+    if [ "$stopped" -eq 0 ]; then
+        log "no running container for this PWD"
+    fi
+}
+
+cmd_rm() {
+    local runtime
+    runtime="$(detect_runtime)"
+    local removed=0 name
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        "$runtime" stop "$name" >/dev/null 2>&1 || true
+        if "$runtime" rm "$name" >/dev/null 2>&1; then
+            log "removed $name"
+            removed=$((removed + 1))
+        else
+            warn "could not remove $name"
+        fi
+    done <<<"$(_list_pwd_containers "$runtime")"
+    if [ "$removed" -eq 0 ]; then
+        log "no persistent container for this PWD"
+    fi
+}
+
+cmd_ps() {
+    local runtime
+    runtime="$(detect_runtime)"
+    # Show all isoclaude-* containers across all PWDs, with state.
+    "$runtime" list -a --format json 2>/dev/null | python3 -c '
+import sys, json
+try: data = json.load(sys.stdin)
+except Exception: sys.exit(0)
+rows = []
+def status_of(o):
+    if not isinstance(o, dict): return ""
+    for k in ("Status", "status"):
+        s = o.get(k)
+        if isinstance(s, str): return s
+    st = o.get("State") or o.get("state")
+    if isinstance(st, dict):
+        for k in ("Status", "status"):
+            s = st.get(k)
+            if isinstance(s, str): return s
+    if isinstance(st, str): return st
+    return ""
+def name_of(o):
+    if not isinstance(o, dict): return None
+    for k in ("Name", "name", "ID", "id"):
+        v = o.get(k)
+        if isinstance(v, str): return v.lstrip("/")
+    ns = o.get("Names") or o.get("names")
+    if isinstance(ns, list) and ns and isinstance(ns[0], str):
+        return ns[0].lstrip("/")
+    return None
+def walk(o):
+    if isinstance(o, dict):
+        n = name_of(o)
+        if n and n.startswith("isoclaude-"):
+            rows.append((n, status_of(o)))
+        for v in o.values(): walk(v)
+    elif isinstance(o, list):
+        for v in o: walk(v)
+walk(data)
+if not rows:
+    sys.exit(0)
+w = max(len(n) for n, _ in rows)
+for n, s in sorted(rows):
+    print(f"{n.ljust(w)}  {s}")
+' 2>/dev/null || true
+}
+
 cmd_uninstall() {
     local purge=0 yes=0
     while [ "$#" -gt 0 ]; do
@@ -1105,6 +1406,11 @@ SUBCOMMANDS
                             current global pin) and rebuild.
     prune [--all]           Remove built project images. Without --all,
                             keeps the current project's active image.
+    stop                    Stop this PWD's persistent container if it
+                            is running. No-op for non-persistent PWDs.
+    rm                      Stop and delete this PWD's persistent
+                            container. Next isoclaude run starts fresh.
+    ps                      List all isoclaude-* containers across PWDs.
     sync-auth               macOS only. Copy Claude Code's keychain
                             credentials to ~/.claude/.credentials.json so
                             the in-container claude can authenticate.
@@ -1124,6 +1430,18 @@ GLOBAL FLAGS
                             Only affects `run` (the default); ignored by
                             other subcommands. Strippable from anywhere
                             in the args.
+    --keep, -k              Create a persistent container for this PWD
+                            instead of an ephemeral one. The container
+                            stops cleanly when claude exits, but its
+                            writable layer (apt installs, MCP state,
+                            /tmp, shell history) survives. Subsequent
+                            isoclaude runs in the same PWD auto-resume
+                            it — you do NOT need to pass --keep again.
+                            Use `isoclaude rm` to discard it.
+    --no-keep               Force one-off ephemeral even when a
+                            persistent container already exists for
+                            this PWD. The persistent container is
+                            untouched.
 
 ENVIRONMENT
     ISOCLAUDE_HOME           Override the install dir (default: ~/.isoclaude).
@@ -1131,20 +1449,31 @@ ENVIRONMENT
     ISOCLAUDE_BASE_IMAGE     Override base image tag.
     ISOCLAUDE_DRY_RUN=1      Print the runtime invocation; don't exec.
     ISOCLAUDE_YOLO=1         Same as passing --yolo on every invocation.
+    ISOCLAUDE_KEEP=1         Same as passing --keep on every invocation.
 EOF
 }
 
 main() {
-    # Scan for global flags (currently just --yolo / -Y), strip them, and
-    # remember in YOLO. Order-independent up to `--`: once we see the
-    # separator, everything after is preserved as a literal arg (so users
-    # can pass a literal `--yolo` to claude if they really need to).
+    # Scan for global flags, strip them, stash in module-level vars.
+    # Order-independent up to `--`: once we see the separator, everything
+    # after is preserved as a literal arg.
+    #   --yolo / -Y          → YOLO=1 (skip permission prompts)
+    #   --keep / -k          → KEEP=1 (create a persistent container; on
+    #                          subsequent runs in the same PWD, isoclaude
+    #                          auto-resumes it whether or not --keep is
+    #                          passed)
+    #   --no-keep            → KEEP=0 force-ephemeral (useful when a
+    #                          persistent container exists but the user
+    #                          wants a one-off clean run)
     YOLO="${ISOCLAUDE_YOLO:-0}"
+    KEEP="${ISOCLAUDE_KEEP:-0}"
     local args=() arg seen_dashdash=0
     for arg in "$@"; do
         if [ "$seen_dashdash" = 0 ]; then
             case "$arg" in
                 --yolo|-Y) YOLO=1; continue ;;
+                --keep|-k) KEEP=1; continue ;;
+                --no-keep) KEEP=0; FORCE_EPHEMERAL=1; continue ;;
                 --)        seen_dashdash=1 ;;  # fall through, preserve --
             esac
         fi
@@ -1161,6 +1490,9 @@ main() {
         update)         shift; cmd_update "$@" ;;
         pin)            shift; cmd_pin "$@" ;;
         prune)          shift; cmd_prune "$@" ;;
+        stop)           shift; cmd_stop "$@" ;;
+        rm)             shift; cmd_rm "$@" ;;
+        ps)             shift; cmd_ps "$@" ;;
         sync-auth)      shift; cmd_sync_auth "$@" ;;
         doctor)         shift; cmd_doctor "$@" ;;
         uninstall)      shift; cmd_uninstall "$@" ;;

@@ -1,0 +1,430 @@
+#!/usr/bin/env bash
+# Phase 6 tests: --keep / persistent-container lifecycle.
+#
+# Covers:
+#   - --keep / -k / ISOCLAUDE_KEEP flag parsing
+#   - compose_run_flags drops --rm and adds the cmd-file mount when KEEP=1
+#   - _container_name is deterministic per PWD+image
+#   - _exec_in_sandbox dispatches: missing+keep → run --name (no --rm),
+#     stopped → start -ai, running → exec, missing+!keep → run --rm
+#   - cmd file is written with shell-quoted argv (printf %q)
+#   - --no-keep forces ephemeral even when a container "exists"
+#   - cmd_stop / cmd_rm / cmd_ps run cleanly against the fake runtime
+
+set -e
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+WRAPPER="$REPO/bin/isoclaude"
+
+pass=0
+fail=0
+ok()  { printf '  \033[32mok\033[0m   %s\n' "$1"; pass=$((pass+1)); }
+bad() { printf '  \033[31mFAIL\033[0m %s — %s\n' "$1" "${2:-}"; fail=$((fail+1)); }
+section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
+
+#-----------------------------------------------------------------------
+section "Test harness"
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+# Resolve TMP through symlinks so comparisons match the wrapper's
+# canonical (cd -P) output.
+TMP="$(cd -P "$TMP" && pwd -P)"
+
+# Fake docker that the dispatcher's `inspect` and `list` probes can drive
+# via env vars. Each invocation also gets logged for argv inspection.
+mkdir -p "$TMP/fakebin"
+cat > "$TMP/fakebin/docker" <<'EOF'
+#!/usr/bin/env bash
+echo "$@" >> "$FAKE_DOCKER_LOG"
+case "$1" in
+    inspect)
+        # FAKE_STATE drives the dispatcher:
+        #   ""       → exit nonzero (container missing)
+        #   running  → JSON with status=running
+        #   stopped  → JSON with status=stopped
+        if [ -z "${FAKE_STATE:-}" ]; then
+            exit 1
+        fi
+        printf '[{"State":{"Status":"%s"}}]\n' "$FAKE_STATE"
+        exit 0
+        ;;
+    image)
+        if [ "$2" = "inspect" ]; then
+            if [ -n "${FAKE_LABEL:-}" ]; then
+                printf '[{"Config":{"Labels":{"isoclaude.claude_version":"%s"}}}]\n' "$FAKE_LABEL"
+                exit 0
+            fi
+            exit 1
+        fi
+        if [ "$2" = "rm" ]; then exit 0; fi
+        ;;
+    list)
+        # cmd_ps / _list_pwd_containers consume this. Empty JSON array
+        # by default; tests that need entries set FAKE_LIST_JSON.
+        printf '%s\n' "${FAKE_LIST_JSON:-[]}"
+        exit 0
+        ;;
+    build|run|stop|rm|start|exec) exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$TMP/fakebin/docker"
+
+export HOME="$TMP/home"
+mkdir -p "$HOME/.claude" "$HOME/.ssh"
+echo "[user]" > "$HOME/.gitconfig"
+echo "k" > "$HOME/.ssh/id_ed25519"
+
+export ISOCLAUDE_HOME="$HOME/.isoclaude"
+export ISOCLAUDE_RUNTIME="docker"
+export ISOCLAUDE_BASE_IMAGE="isoclaude-base:test"
+export PATH="$TMP/fakebin:$PATH"
+export FAKE_DOCKER_LOG="$TMP/docker.log"
+
+# shellcheck disable=SC1090
+. "$WRAPPER"
+ok "wrapper sourced"
+
+reset() {
+    rm -rf "$ISOCLAUDE_HOME" "$TMP/proj"
+    mkdir -p "$ISOCLAUDE_HOME" "$TMP/proj"
+    cp "$REPO/image/Dockerfile.base" "$ISOCLAUDE_HOME/Dockerfile.base"
+    cp "$REPO/image/entrypoint.sh"   "$ISOCLAUDE_HOME/entrypoint.sh"
+    echo "1.2.3" > "$ISOCLAUDE_HOME/claude-version"
+    : > "$FAKE_DOCKER_LOG"
+    unset FAKE_LABEL FAKE_STATE FAKE_LIST_JSON
+    export FAKE_LABEL="1.2.3"  # base image is "built"
+    YOLO=0
+    KEEP=0
+    FORCE_EPHEMERAL=0
+    PROJECT_ROOT=""
+    # Dry-run so the dispatcher prints its invocation instead of exec'ing
+    # the fake docker (which produces no stdout for run/start/exec).
+    export ISOCLAUDE_DRY_RUN=1
+    export ISOCLAUDE_AUTH_REFRESH=0
+    cd "$TMP/proj"
+}
+
+#-----------------------------------------------------------------------
+section "Container-name derivation"
+
+reset
+RUN_IMAGE="isoclaude-base:test"
+name1="$(_container_name)"
+name2="$(_container_name)"
+[ "$name1" = "$name2" ] && ok "_container_name is deterministic" \
+    || bad "name not deterministic" "$name1 vs $name2"
+
+case "$name1" in
+    isoclaude-*-*) ok "_container_name has expected isoclaude-<pwd>-<img> shape" ;;
+    *) bad "name shape" "got: $name1" ;;
+esac
+
+# Different image → different name (so an image rebuild orphans the old
+# container instead of silently reusing one with stale rootfs).
+RUN_IMAGE="isoclaude-base:test" ; a="$(_container_name)"
+RUN_IMAGE="isoclaude-base:other"; b="$(_container_name)"
+[ "$a" != "$b" ] && ok "different image → different name" \
+    || bad "image tag not part of name" "both: $a"
+
+# Different PWD → different name
+RUN_IMAGE="isoclaude-base:test"
+a="$(_container_name)"
+mkdir -p "$TMP/other" && b="$(cd "$TMP/other" && _container_name)"
+[ "$a" != "$b" ] && ok "different PWD → different name" \
+    || bad "PWD not part of name" "both: $a"
+cd "$TMP/proj"
+
+#-----------------------------------------------------------------------
+section "compose_run_flags honors KEEP"
+
+reset
+KEEP=0
+RUN_FLAGS=()
+compose_run_flags
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    *"--rm"*) ok "KEEP=0 keeps --rm" ;;
+    *) bad "ephemeral path missing --rm" "flags: $flags" ;;
+esac
+case "$flags" in
+    *"/home/claude/.isoclaude/cmd"*) bad "cmd mount added when KEEP=0" "flags: $flags" ;;
+    *) ok "no cmd mount when KEEP=0" ;;
+esac
+
+reset
+KEEP=1
+RUN_FLAGS=()
+compose_run_flags
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    *"--rm"*) bad "KEEP=1 still has --rm" "flags: $flags" ;;
+    *) ok "KEEP=1 drops --rm" ;;
+esac
+case "$flags" in
+    *":/home/claude/.isoclaude/cmd:ro"*) ok "KEEP=1 adds cmd-file mount ro" ;;
+    *) bad "KEEP=1 missing cmd mount" "flags: $flags" ;;
+esac
+[ -f "$TMP/proj/.isoclaude/local/cmd" ] && ok "KEEP=1 created cmd file" \
+    || bad "cmd file not created"
+
+#-----------------------------------------------------------------------
+section "_container_state JSON parsing"
+
+reset
+export FAKE_STATE=""
+[ -z "$(_container_state docker isoclaude-foo)" ] \
+    && ok "missing container → empty state" || bad "missing not empty"
+
+export FAKE_STATE="running"
+[ "$(_container_state docker isoclaude-foo)" = "running" ] \
+    && ok "Status=running parsed as 'running'" || bad "running parse"
+
+export FAKE_STATE="stopped"
+[ "$(_container_state docker isoclaude-foo)" = "stopped" ] \
+    && ok "Status=stopped parsed as 'stopped'" || bad "stopped parse"
+
+export FAKE_STATE="exited"
+[ "$(_container_state docker isoclaude-foo)" = "stopped" ] \
+    && ok "Status=exited normalized to 'stopped'" || bad "exited not normalized"
+
+#-----------------------------------------------------------------------
+section "_exec_in_sandbox dispatch — missing + KEEP=1 → run --name (no --rm)"
+
+reset
+KEEP=1
+export FAKE_STATE=""
+_prepare
+out="$(_exec_in_sandbox docker claude --resume X 2>/dev/null | tail -1)"
+case "$out" in
+    *"docker run"*) ok "uses run when missing" ;;
+    *) bad "wrong verb" "got: $out" ;;
+esac
+case "$out" in
+    *"--rm"*) bad "KEEP=1 still emits --rm" "got: $out" ;;
+    *) ok "no --rm" ;;
+esac
+case "$out" in
+    *"--name isoclaude-"*) ok "passes --name" ;;
+    *) bad "no --name" "got: $out" ;;
+esac
+case "$out" in
+    *"claude --resume X") bad "argv leaked through CMD instead of file" "got: $out" ;;
+    *) ok "argv goes via cmd file, not CMD" ;;
+esac
+[ -f "$TMP/proj/.isoclaude/local/cmd" ] \
+    && grep -q 'claude --resume X' "$TMP/proj/.isoclaude/local/cmd" \
+    && ok "cmd file contains 'claude --resume X'" \
+    || bad "cmd file wrong" "got: $(cat "$TMP/proj/.isoclaude/local/cmd" 2>/dev/null)"
+
+#-----------------------------------------------------------------------
+section "_exec_in_sandbox dispatch — stopped → start -ai"
+
+reset
+KEEP=1
+export FAKE_STATE="stopped"
+_prepare
+out="$(_exec_in_sandbox docker claude --resume Y 2>/dev/null | tail -1)"
+case "$out" in
+    *"docker start -a -i isoclaude-"*) ok "stopped → start -a -i <name>" ;;
+    *) bad "stopped dispatch" "got: $out" ;;
+esac
+grep -q 'claude --resume Y' "$TMP/proj/.isoclaude/local/cmd" \
+    && ok "stopped path rewrites cmd file with fresh args" \
+    || bad "cmd file not refreshed" "got: $(cat "$TMP/proj/.isoclaude/local/cmd")"
+
+#-----------------------------------------------------------------------
+section "_exec_in_sandbox dispatch — running → exec"
+
+reset
+KEEP=1
+export FAKE_STATE="running"
+_prepare
+out="$(_exec_in_sandbox docker claude --resume Z 2>/dev/null | tail -1)"
+case "$out" in
+    *"docker exec"*"isoclaude-"*"claude --resume Z") ok "running → exec <name> claude ..." ;;
+    *) bad "running dispatch" "got: $out" ;;
+esac
+case "$out" in
+    *"-u claude"*) ok "exec drops to claude user" ;;
+    *) bad "exec missing -u claude" "got: $out" ;;
+esac
+
+#-----------------------------------------------------------------------
+section "_exec_in_sandbox dispatch — missing + KEEP=0 → run --rm (original)"
+
+reset
+KEEP=0
+export FAKE_STATE=""
+_prepare
+out="$(_exec_in_sandbox docker claude --resume W 2>/dev/null | tail -1)"
+case "$out" in
+    *"docker run"*"--rm"*) ok "ephemeral uses run --rm" ;;
+    *) bad "ephemeral path" "got: $out" ;;
+esac
+case "$out" in
+    *"--name isoclaude-"*) bad "ephemeral emitted --name" "got: $out" ;;
+    *) ok "ephemeral has no --name" ;;
+esac
+case "$out" in
+    *"claude --resume W") ok "ephemeral passes argv through CMD" ;;
+    *) bad "ephemeral CMD" "got: $out" ;;
+esac
+
+#-----------------------------------------------------------------------
+section "Sticky persistence — KEEP auto-on when container already exists"
+
+reset
+KEEP=0          # user did NOT pass --keep
+export FAKE_STATE="stopped"  # but a persistent container already exists
+_prepare
+out="$(_exec_in_sandbox docker claude 2>/dev/null | tail -1)"
+case "$out" in
+    *"docker start -a -i"*) ok "existing container auto-resumed without --keep" ;;
+    *"docker run"*) bad "ignored existing container" "got: $out" ;;
+    *) bad "auto-resume" "got: $out" ;;
+esac
+
+#-----------------------------------------------------------------------
+section "--no-keep forces ephemeral past an existing container"
+
+reset
+KEEP=0
+FORCE_EPHEMERAL=1
+export FAKE_STATE="running"   # would normally exec into it
+_prepare
+out="$(_exec_in_sandbox docker claude 2>/dev/null | tail -1)"
+case "$out" in
+    *"docker run --rm"*) ok "--no-keep forces fresh ephemeral run" ;;
+    *) bad "--no-keep did not bypass" "got: $out" ;;
+esac
+
+#-----------------------------------------------------------------------
+section "_write_persist_cmd handles spaces and special chars"
+
+reset
+_write_persist_cmd "$TMP/cmdfile" claude --resume "has spaces" -- "weird'quote"
+got="$(cat "$TMP/cmdfile")"
+# After eval, the argv should reconstruct exactly. Test via re-eval.
+eval "set -- $got"
+[ "$#" = 5 ] && ok "_write_persist_cmd: argc preserved ($#)" || bad "argc" "got $#"
+[ "$3" = "has spaces" ] && ok "_write_persist_cmd: spaces preserved" \
+    || bad "spaces" "got '$3'"
+[ "$5" = "weird'quote" ] && ok "_write_persist_cmd: single quote preserved" \
+    || bad "quote" "got '$5'"
+
+#-----------------------------------------------------------------------
+section "Flag parsing — --keep / -k / ISOCLAUDE_KEEP / --no-keep"
+
+RUN_WRAPPER() {
+    ISOCLAUDE_HOME="$ISOCLAUDE_HOME" \
+    ISOCLAUDE_RUNTIME=docker \
+    ISOCLAUDE_BASE_IMAGE="$ISOCLAUDE_BASE_IMAGE" \
+    ISOCLAUDE_DRY_RUN=1 \
+    ISOCLAUDE_AUTH_REFRESH=0 \
+    PATH="$PATH" HOME="$HOME" \
+    FAKE_DOCKER_LOG="$FAKE_DOCKER_LOG" \
+    FAKE_LABEL="1.2.3" \
+    "$WRAPPER" "$@"
+}
+
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER --keep 2>&1 | tail -1)
+case "$out" in
+    *"--name isoclaude-"*) ok "--keep before subcommand enables persistence" ;;
+    *) bad "--keep before" "got: $out" ;;
+esac
+
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER run --keep 2>&1 | tail -1)
+case "$out" in
+    *"--name isoclaude-"*) ok "--keep after subcommand enables persistence" ;;
+    *) bad "--keep after" "got: $out" ;;
+esac
+
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER -k 2>&1 | tail -1)
+case "$out" in
+    *"--name isoclaude-"*) ok "-k short alias" ;;
+    *) bad "-k" "got: $out" ;;
+esac
+
+reset
+out=$(cd "$TMP/proj" && ISOCLAUDE_KEEP=1 RUN_WRAPPER 2>&1 | tail -1)
+case "$out" in
+    *"--name isoclaude-"*) ok "ISOCLAUDE_KEEP=1 env var" ;;
+    *) bad "ISOCLAUDE_KEEP env" "got: $out" ;;
+esac
+
+# Default — neither flag nor env → ephemeral
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER 2>&1 | tail -1)
+case "$out" in
+    *"--name isoclaude-"*) bad "default added --name" "got: $out" ;;
+    *"--rm"*) ok "default is ephemeral (--rm, no --name)" ;;
+    *) bad "default" "got: $out" ;;
+esac
+
+# --keep after `--` is a literal claude arg
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER -- --keep 2>&1 | tail -1)
+case "$out" in
+    *"--name isoclaude-"*) bad "--keep after -- was consumed" "got: $out" ;;
+    *claude*--keep*) ok "--keep after -- passes through as a literal arg" ;;
+    *) bad "after-dashdash" "got: $out" ;;
+esac
+
+#-----------------------------------------------------------------------
+section "Lifecycle subcommands — cmd_stop / cmd_rm / cmd_ps"
+
+reset
+# Make _list_pwd_containers return one entry.
+pwd_real="$(cd -P "$PWD" && pwd -P)"
+pwd_hash="$(_short_hash "$pwd_real" 12)"
+export FAKE_LIST_JSON='[{"name":"isoclaude-'"$pwd_hash"'-aaaaaaaa","status":"stopped"}]'
+
+out="$(cmd_stop 2>&1)"
+case "$out" in
+    *"stopped isoclaude-${pwd_hash}-"*) ok "cmd_stop matches PWD-hash prefix" ;;
+    *"no running container"*) ok "cmd_stop tolerates stop failure" ;;
+    *) bad "cmd_stop" "got: $out" ;;
+esac
+
+out="$(cmd_rm 2>&1)"
+case "$out" in
+    *"removed isoclaude-${pwd_hash}-"*) ok "cmd_rm matches PWD-hash prefix" ;;
+    *) bad "cmd_rm" "got: $out" ;;
+esac
+
+# cmd_ps lists ALL isoclaude-* containers regardless of PWD.
+export FAKE_LIST_JSON='[{"name":"isoclaude-aaa-bbb","status":"running"},{"name":"unrelated","status":"running"}]'
+out="$(cmd_ps 2>&1)"
+case "$out" in
+    *"isoclaude-aaa-bbb"*"running"*) ok "cmd_ps shows isoclaude container with state" ;;
+    *) bad "cmd_ps" "got: $out" ;;
+esac
+case "$out" in
+    *unrelated*) bad "cmd_ps showed unrelated container" "got: $out" ;;
+    *) ok "cmd_ps filters non-isoclaude containers" ;;
+esac
+
+# Empty list — no output, no crash.
+export FAKE_LIST_JSON='[]'
+cmd_ps >/dev/null 2>&1 && ok "cmd_ps handles empty list" || bad "cmd_ps empty crashed"
+
+#-----------------------------------------------------------------------
+section "Help text mentions persistence"
+
+reset
+out="$(cmd_help)"
+for tok in "--keep" "stop" "rm" "ps" "ISOCLAUDE_KEEP" "--no-keep"; do
+    case "$out" in
+        *"$tok"*) ok "help mentions '$tok'" ;;
+        *) bad "help missing '$tok'" ;;
+    esac
+done
+
+#-----------------------------------------------------------------------
+printf '\n\033[1mPhase 6: %d passed, %d failed\033[0m\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]
