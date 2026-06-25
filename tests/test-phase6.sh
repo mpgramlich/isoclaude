@@ -65,11 +65,33 @@ case "$1" in
         printf '%s\n' "${FAKE_LIST_JSON:-[]}"
         exit 0
         ;;
+    network)
+        # FAKE_OFFLINE_NET_EXISTS=1 → inspect returns non-empty JSON;
+        # 0 (default) → empty []. create always succeeds.
+        if [ "$2" = "inspect" ]; then
+            if [ "${FAKE_OFFLINE_NET_EXISTS:-0}" = "1" ]; then
+                printf '[{"name":"isoclaude-offline"}]\n'
+            else
+                printf '[]\n'
+            fi
+            exit 0
+        fi
+        if [ "$2" = "create" ]; then
+            echo "1" > "${FAKE_OFFLINE_NET_FLAG:-/dev/null}"
+            exit 0
+        fi
+        exit 0
+        ;;
     build|run|stop|rm|start|exec) exit 0 ;;
 esac
 exit 0
 EOF
 chmod +x "$TMP/fakebin/docker"
+
+# Mirror the fake docker as a `container` binary too — _ensure_offline_network
+# short-circuits on non-container runtimes, so we need an actual `container`
+# command for those tests. Same logging target.
+ln -sf docker "$TMP/fakebin/container"
 
 export HOME="$TMP/home"
 mkdir -p "$HOME/.claude" "$HOME/.ssh"
@@ -97,8 +119,10 @@ reset() {
     export FAKE_LABEL="1.2.3"  # base image is "built"
     YOLO=0
     KEEP=0
+    OFFLINE=0
     FORCE_EPHEMERAL=0
     PROJECT_ROOT=""
+    unset FAKE_OFFLINE_NET_EXISTS
     # Dry-run so the dispatcher prints its invocation instead of exec'ing
     # the fake docker (which produces no stdout for run/start/exec).
     export ISOCLAUDE_DRY_RUN=1
@@ -419,6 +443,135 @@ section "Help text mentions persistence"
 reset
 out="$(cmd_help)"
 for tok in "--keep" "stop" "rm" "ps" "ISOCLAUDE_KEEP" "--no-keep"; do
+    case "$out" in
+        *"$tok"*) ok "help mentions '$tok'" ;;
+        *) bad "help missing '$tok'" ;;
+    esac
+done
+
+#-----------------------------------------------------------------------
+#-----------------------------------------------------------------------
+section "Offline mode (--offline / -o / ISOCLAUDE_OFFLINE)"
+
+# Flag parsing — same RUN_WRAPPER as the --keep tests.
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER --offline 2>/dev/null | tail -1)
+case "$out" in
+    *"--network none"*) ok "--offline → --network none on docker runtime" ;;
+    *) bad "--offline" "got: $out" ;;
+esac
+
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER -o 2>/dev/null | tail -1)
+case "$out" in
+    *"--network none"*) ok "-o short alias" ;;
+    *) bad "-o" "got: $out" ;;
+esac
+
+reset
+out=$(cd "$TMP/proj" && ISOCLAUDE_OFFLINE=1 RUN_WRAPPER 2>/dev/null | tail -1)
+case "$out" in
+    *"--network none"*) ok "ISOCLAUDE_OFFLINE=1 env var" ;;
+    *) bad "ISOCLAUDE_OFFLINE env" "got: $out" ;;
+esac
+
+# Control: no --offline → no --network in flags.
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER 2>/dev/null | tail -1)
+case "$out" in
+    *"--network"*) bad "default emitted --network" "got: $out" ;;
+    *) ok "default has no --network" ;;
+esac
+
+# Runtime-aware emission: container (Apple) → --network isoclaude-offline + --no-dns
+reset
+export FAKE_OFFLINE_NET_EXISTS=1   # skip the create path in this test
+out="$(OFFLINE=1 _add_offline_flags container; printf '%s ' "${RUN_FLAGS[@]}")"
+RUN_FLAGS=()
+_add_offline_flags container
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    *"--network isoclaude-offline"*) ok "container runtime → --network isoclaude-offline" ;;
+    *) bad "container offline flags" "flags: $flags" ;;
+esac
+case "$flags" in
+    *"--no-dns"*) ok "container runtime → --no-dns (belt and braces)" ;;
+    *) bad "missing --no-dns" "flags: $flags" ;;
+esac
+
+reset
+RUN_FLAGS=()
+_add_offline_flags docker
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    *"--network none"*) ok "docker runtime → --network none" ;;
+    *) bad "docker offline flags" "flags: $flags" ;;
+esac
+case "$flags" in
+    *"--no-dns"*) bad "docker shouldn't emit --no-dns" "flags: $flags" ;;
+    *) ok "docker doesn't emit --no-dns" ;;
+esac
+
+reset
+RUN_FLAGS=()
+_add_offline_flags podman
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    *"--network none"*) ok "podman runtime → --network none" ;;
+    *) bad "podman offline flags" "flags: $flags" ;;
+esac
+
+# Network create skipped when the network already exists. inspect should
+# be called, network create should NOT be called.
+reset
+export FAKE_OFFLINE_NET_EXISTS=1
+: > "$FAKE_DOCKER_LOG"
+RUN_FLAGS=()
+_ensure_offline_network container
+grep -q 'network inspect isoclaude-offline' "$FAKE_DOCKER_LOG" \
+    && ok "ensure: probes with network inspect" \
+    || bad "ensure: missing inspect call" "log: $(cat "$FAKE_DOCKER_LOG")"
+grep -q 'network create' "$FAKE_DOCKER_LOG" \
+    && bad "ensure: should NOT create when network exists" "log: $(cat "$FAKE_DOCKER_LOG")" \
+    || ok "ensure: skips create when network exists"
+
+# Network create runs when network is missing.
+reset
+unset FAKE_OFFLINE_NET_EXISTS
+: > "$FAKE_DOCKER_LOG"
+RUN_FLAGS=()
+_ensure_offline_network container >/dev/null 2>&1
+grep -q 'network create --internal isoclaude-offline' "$FAKE_DOCKER_LOG" \
+    && ok "ensure: creates network when missing" \
+    || bad "ensure: no create call" "log: $(cat "$FAKE_DOCKER_LOG")"
+
+# Apple container's `inspect` quirk: returns 0 with empty array `[]` for
+# missing networks. The probe should treat `[]` as missing, not present.
+reset
+unset FAKE_OFFLINE_NET_EXISTS    # inspect returns []
+: > "$FAKE_DOCKER_LOG"
+_ensure_offline_network container >/dev/null 2>&1
+grep -q 'network create' "$FAKE_DOCKER_LOG" \
+    && ok "ensure: '[]' inspect output treated as missing (not exit code)" \
+    || bad "ensure: '[]' wrongly treated as present" "log: $(cat "$FAKE_DOCKER_LOG")"
+
+# Offline + persistence interplay: --offline + --keep should emit both
+# --network isoclaude-offline and --name on a create.
+reset
+export FAKE_OFFLINE_NET_EXISTS=1
+out=$(cd "$TMP/proj" && ISOCLAUDE_RUNTIME=container RUN_WRAPPER --keep --offline 2>/dev/null | tail -1)
+# Above forces container runtime via the fake docker rename trick? We
+# don't have a fake `container` binary; switch to docker-mode and check
+# --network none + --name together.
+out=$(cd "$TMP/proj" && RUN_WRAPPER --keep --offline 2>/dev/null | tail -1)
+case "$out" in
+    *"--network none"*"--name isoclaude-"*|*"--name isoclaude-"*"--network none"*) ok "--keep + --offline both emitted" ;;
+    *) bad "--keep + --offline combo" "got: $out" ;;
+esac
+
+# Help mentions --offline / ISOCLAUDE_OFFLINE.
+out="$(cmd_help)"
+for tok in "--offline" "ISOCLAUDE_OFFLINE"; do
     case "$out" in
         *"$tok"*) ok "help mentions '$tok'" ;;
         *) bad "help missing '$tok'" ;;

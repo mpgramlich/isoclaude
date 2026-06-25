@@ -262,6 +262,54 @@ if v:
 ' 2>/dev/null
 }
 
+# Ensure the named "isoclaude-offline" host-only network exists on Apple
+# `container`. Idempotent: created once, reused forever. Cheap when it
+# already exists. Runs only when OFFLINE=1 and runtime is Apple container.
+ISOCLAUDE_OFFLINE_NET="isoclaude-offline"
+_ensure_offline_network() {
+    local runtime="$1"
+    [ "$runtime" = "container" ] || return 0
+    # Apple `container network inspect` returns exit 0 even when the
+    # network is missing (prints `[]`), so exit code isn't a reliable
+    # probe. Check the JSON: anything other than literal "[]" means
+    # the network exists.
+    local out
+    out="$("$runtime" network inspect "$ISOCLAUDE_OFFLINE_NET" 2>/dev/null \
+        | tr -d '[:space:]')"
+    if [ -n "$out" ] && [ "$out" != "[]" ]; then
+        return 0
+    fi
+    log "creating offline network: $ISOCLAUDE_OFFLINE_NET (--internal)"
+    if ! "$runtime" network create --internal "$ISOCLAUDE_OFFLINE_NET" \
+            >/dev/null 2>&1; then
+        warn "failed to create $ISOCLAUDE_OFFLINE_NET; falling back to --no-dns only"
+        return 1
+    fi
+}
+
+# Add the runtime-appropriate flags to disable internet access. Apple
+# `container` uses an --internal network plus --no-dns (belt and braces:
+# even if the network is misconfigured, the resolver is gone too).
+# docker / podman expose a clean --network none that gives the container
+# only a loopback interface — no external, no DNS, no host either.
+_add_offline_flags() {
+    local runtime="$1"
+    case "$runtime" in
+        container)
+            if _ensure_offline_network "$runtime"; then
+                _add "--network" "$ISOCLAUDE_OFFLINE_NET"
+            fi
+            _add "--no-dns"
+            ;;
+        docker|podman|orb)
+            _add "--network" "none"
+            ;;
+        *)
+            warn "offline mode unsupported on runtime '$runtime'; no flags added"
+            ;;
+    esac
+}
+
 # Write the argv that the persisted container should run on its next
 # start into the host-side cmd file. Each token is shell-quoted with
 # printf %q so the entrypoint's eval reconstructs the original argv
@@ -554,6 +602,14 @@ _exec_in_sandbox() {
         fi
         _spawn_auth_refresher "$runtime" "$cname"
         exec "$runtime" start -a -i "$cname"
+    fi
+
+    # Offline mode applies only on container *create* (run); for exec /
+    # start the network was baked in at create time and can't be changed.
+    # If the user passes --offline against a persistent container that
+    # was created online, that's a no-op — they should rm it first.
+    if [ "${OFFLINE:-0}" = "1" ]; then
+        _add_offline_flags "$runtime"
     fi
 
     # ---- CREATE a fresh container (run) ----------------------------------
@@ -1442,6 +1498,13 @@ GLOBAL FLAGS
                             persistent container already exists for
                             this PWD. The persistent container is
                             untouched.
+    --offline, -o           Cut the container off from the internet at
+                            create time. Apple `container`: host-only
+                            network + --no-dns. docker/podman: --network
+                            none. Only effective when CREATING a
+                            container — for an existing persistent
+                            container, `isoclaude rm` first, then run
+                            again with --offline.
 
 ENVIRONMENT
     ISOCLAUDE_HOME           Override the install dir (default: ~/.isoclaude).
@@ -1450,6 +1513,7 @@ ENVIRONMENT
     ISOCLAUDE_DRY_RUN=1      Print the runtime invocation; don't exec.
     ISOCLAUDE_YOLO=1         Same as passing --yolo on every invocation.
     ISOCLAUDE_KEEP=1         Same as passing --keep on every invocation.
+    ISOCLAUDE_OFFLINE=1      Same as passing --offline on every invocation.
 EOF
 }
 
@@ -1467,14 +1531,16 @@ main() {
     #                          wants a one-off clean run)
     YOLO="${ISOCLAUDE_YOLO:-0}"
     KEEP="${ISOCLAUDE_KEEP:-0}"
+    OFFLINE="${ISOCLAUDE_OFFLINE:-0}"
     local args=() arg seen_dashdash=0
     for arg in "$@"; do
         if [ "$seen_dashdash" = 0 ]; then
             case "$arg" in
-                --yolo|-Y) YOLO=1; continue ;;
-                --keep|-k) KEEP=1; continue ;;
-                --no-keep) KEEP=0; FORCE_EPHEMERAL=1; continue ;;
-                --)        seen_dashdash=1 ;;  # fall through, preserve --
+                --yolo|-Y)    YOLO=1; continue ;;
+                --keep|-k)    KEEP=1; continue ;;
+                --no-keep)    KEEP=0; FORCE_EPHEMERAL=1; continue ;;
+                --offline|-o) OFFLINE=1; continue ;;
+                --)           seen_dashdash=1 ;;  # fall through, preserve --
             esac
         fi
         args+=("$arg")
