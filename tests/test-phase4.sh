@@ -21,6 +21,9 @@ section "Test harness"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+# Resolve TMP through symlinks so comparisons match the wrapper's
+# canonical (cd -P) output. macOS makes /var → /private/var.
+TMP="$(cd -P "$TMP" && pwd -P)"
 
 # Fake runtime that logs argv and "succeeds" at build/inspect-by-existence.
 mkdir -p "$TMP/fakebin"

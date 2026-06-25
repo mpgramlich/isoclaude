@@ -37,6 +37,10 @@ section "Test harness setup"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+# Resolve TMP through symlinks. macOS makes /var → /private/var, and the
+# wrapper canonicalizes paths via `cd -P`/`pwd -P`, so its outputs use
+# the resolved form. Comparisons must use the same form to match.
+TMP="$(cd -P "$TMP" && pwd -P)"
 
 # Fake docker that records its argv so we can inspect what would be run.
 mkdir -p "$TMP/fakebin"
