@@ -488,6 +488,15 @@ compose_run_flags() {
         done
     fi
 
+    # CLI --volume/-v flags last, after .isoclaude/mounts, for the same
+    # last-wins reason.
+    if [ "${#VOLUME[@]}" -gt 0 ]; then
+        local vspec
+        for vspec in "${VOLUME[@]}"; do
+            _add_volume_spec "$vspec" "CLI"
+        done
+    fi
+
     # Resource caps. Same docker-style syntax across runtimes — pass
     # through verbatim. Empty → don't emit (let runtime use its default).
     if [ -n "${MEMORY:-}" ]; then
@@ -576,33 +585,43 @@ _add_project_ports() {
     done < "$file"
 }
 
+# Validate one mount spec and append it as `-v <spec>` to RUN_FLAGS.
+# Spec format: /host:/container[:ro|:rw]. Expands a leading ~ in the host
+# path; warns and skips if host doesn't exist (skipping silently would
+# mask a real problem; failing hard would block the whole launch for a
+# typo). Shared between CLI --volume/-v and .isoclaude/mounts.
+_add_volume_spec() {
+    local spec="$1" src="${2:-CLI}" host rest
+    case "$spec" in
+        ""|"#"*) return 0 ;;
+    esac
+    case "$spec" in
+        *:*) ;;
+        *) warn "$src: skipping invalid mount spec: $spec"; return 0 ;;
+    esac
+    host="${spec%%:*}"
+    rest="${spec#*:}"
+    case "$host" in
+        "~")    host="$HOME" ;;
+        "~/"*)  host="$HOME/${host#\~/}" ;;
+    esac
+    if [ ! -e "$host" ]; then
+        warn "$src: host path doesn't exist, skipping: $spec"
+        return 0
+    fi
+    _add_mount "$host:$rest"
+}
+
 # Read a mounts file, one spec per line, format: /host:/container[:ro|:rw].
-# Skips comments and blank lines, expands a leading ~ in the host path.
+# Skips comments and blank lines.
 _add_project_mounts() {
-    local file="$1" line host rest
+    local file="$1" line trimmed
     [ -f "$file" ] || return 0
     while IFS= read -r line || [ -n "$line" ]; do
         line="${line%$'\r'}"
-        line="${line#"${line%%[![:space:]]*}"}"
-        case "$line" in ""|"#"*) continue ;; esac
-        case "$line" in
-            *:*) ;;
-            *)   warn "skipping invalid mount line in $file: $line"; continue ;;
-        esac
-        host="${line%%:*}"
-        rest="${line#*:}"
-        case "$host" in
-            "~")    host="$HOME" ;;
-            "~/"*)  host="$HOME/${host#\~/}" ;;
-        esac
-        # Pre-check: runtime errors with a cryptic message if the host
-        # path doesn't exist. Warn loudly and skip — silently dropping a
-        # mount the user asked for would hide a real problem.
-        if [ ! -e "$host" ]; then
-            warn "$file: host path doesn't exist, skipping: $line"
-            continue
-        fi
-        _add_mount "$host:$rest"
+        trimmed="${line#"${line%%[![:space:]]*}"}"
+        case "$trimmed" in ""|"#"*) continue ;; esac
+        _add_volume_spec "$trimmed" "$file"
     done < "$file"
 }
 
@@ -1575,6 +1594,12 @@ GLOBAL FLAGS
                             Repeatable. Recurring ports for a project
                             can also go in .isoclaude/ports (one spec
                             per line, # comments).
+    --volume, -v SPEC       Bind mount a host path into the container.
+                            SPEC follows docker -v syntax:
+                            /host:/container[:ro|:rw]. Leading ~ is
+                            expanded to $HOME. Repeatable. Recurring
+                            mounts for a project can also go in
+                            .isoclaude/mounts.
     --offline, -o           Cut the container off from the internet at
                             create time. Apple `container`: host-only
                             network + --no-dns. docker/podman: --network
@@ -1623,6 +1648,10 @@ main() {
     #                          [host-ip:]host-port:container-port[/proto].
     #                          Bare numeric ("8080") is shorthand for
     #                          host:container of the same number.
+    #   --volume / -v SPEC   → append SPEC to VOLUME (repeatable). Each
+    #                          spec follows docker -v syntax:
+    #                          /host:/container[:ro|:rw]. A leading ~
+    #                          is expanded to $HOME.
     #   --memory / -m N      → MEMORY=N (docker syntax: 4g, 512m, bytes).
     #   --cpus N             → CPUS=N (docker syntax: 2, 0.5, 1.5).
     YOLO="${ISOCLAUDE_YOLO:-0}"
@@ -1631,6 +1660,7 @@ main() {
     MEMORY="${ISOCLAUDE_MEMORY:-}"
     CPUS="${ISOCLAUDE_CPUS:-}"
     PUBLISH=()
+    VOLUME=()
     local args=() seen_dashdash=0 i=1
     while [ "$i" -le "$#" ]; do
         local arg="${!i}"
@@ -1649,6 +1679,15 @@ main() {
                     i=$((i+1)); continue ;;
                 --publish=*)  PUBLISH+=("${arg#--publish=}"); i=$((i+1)); continue ;;
                 -p=*)         PUBLISH+=("${arg#-p=}"); i=$((i+1)); continue ;;
+                --volume|-v)
+                    i=$((i+1))
+                    if [ "$i" -gt "$#" ]; then
+                        die "$arg requires an argument"
+                    fi
+                    VOLUME+=("${!i}")
+                    i=$((i+1)); continue ;;
+                --volume=*)   VOLUME+=("${arg#--volume=}"); i=$((i+1)); continue ;;
+                -v=*)         VOLUME+=("${arg#-v=}"); i=$((i+1)); continue ;;
                 --memory|-m)
                     i=$((i+1))
                     if [ "$i" -gt "$#" ]; then

@@ -203,7 +203,7 @@ echo "no-colon-here" > "$TMP/proj/.isoclaude/mounts"
 out=$(compose_run_flags 2>&1)
 flags="${RUN_FLAGS[*]}"
 case "$out" in
-    *"skipping invalid mount line"*"no-colon-here"*) ok "warns on invalid mount line" ;;
+    *"skipping invalid mount spec"*"no-colon-here"*) ok "warns on invalid mount line" ;;
     *) bad "no warning" "out: $out" ;;
 esac
 case "$flags" in

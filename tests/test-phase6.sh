@@ -845,5 +845,161 @@ for tok in "--memory" "--cpus" "ISOCLAUDE_MEMORY" "ISOCLAUDE_CPUS"; do
 done
 
 #-----------------------------------------------------------------------
+section "Extra bind mounts (--volume / -v / .isoclaude/mounts)"
+
+# Direct unit: _add_volume_spec passes a full spec through unchanged
+# when the host path exists.
+reset
+mkdir -p "$TMP/extra"
+RUN_FLAGS=()
+_add_volume_spec "$TMP/extra:/data" "CLI"
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    "-v $TMP/extra:/data") ok "_add_volume_spec: rw spec passes through" ;;
+    *) bad "rw spec emission" "flags: $flags" ;;
+esac
+
+# :ro suffix preserved.
+reset
+mkdir -p "$TMP/extra"
+RUN_FLAGS=()
+_add_volume_spec "$TMP/extra:/data:ro" "CLI"
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    "-v $TMP/extra:/data:ro") ok "_add_volume_spec: ro suffix preserved" ;;
+    *) bad "ro suffix" "flags: $flags" ;;
+esac
+
+# Leading ~ expanded to $HOME.
+reset
+mkdir -p "$HOME/extra"
+RUN_FLAGS=()
+_add_volume_spec "~/extra:/data" "CLI"
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    "-v $HOME/extra:/data") ok "_add_volume_spec: ~ expands to \$HOME" ;;
+    *) bad "tilde expansion" "flags: $flags" ;;
+esac
+
+# Missing host path → warn, no flag.
+reset
+RUN_FLAGS=()
+out=$(_add_volume_spec "$TMP/does-not-exist:/data" "CLI" 2>&1)
+case "$out" in
+    *"host path doesn't exist"*) ok "_add_volume_spec: warns on missing host" ;;
+    *) bad "missing-host warning" "got: $out" ;;
+esac
+[ "${#RUN_FLAGS[@]}" = 0 ] && ok "_add_volume_spec: missing host emits no -v" \
+    || bad "leaked missing-host flag" "flags: ${RUN_FLAGS[*]}"
+
+# Missing colon → warn, no flag.
+reset
+RUN_FLAGS=()
+out=$(_add_volume_spec "no-colon-here" "CLI" 2>&1)
+case "$out" in
+    *"skipping invalid mount spec"*) ok "_add_volume_spec: warns on missing colon" ;;
+    *) bad "missing-colon warning" "got: $out" ;;
+esac
+[ "${#RUN_FLAGS[@]}" = 0 ] && ok "_add_volume_spec: missing colon emits no -v" \
+    || bad "leaked missing-colon flag" "flags: ${RUN_FLAGS[*]}"
+
+# Empty / comment lines → no flag.
+reset
+RUN_FLAGS=()
+_add_volume_spec "" "CLI"
+_add_volume_spec "#comment" "CLI"
+[ "${#RUN_FLAGS[@]}" = 0 ] && ok "empty/comment volume specs produce no flags" \
+    || bad "empty/comment emitted" "flags: ${RUN_FLAGS[*]}"
+
+# CLI --volume / -v end-to-end.
+reset
+mkdir -p "$TMP/extra"
+out=$(cd "$TMP/proj" && RUN_WRAPPER --volume "$TMP/extra:/data:ro" 2>/dev/null | tail -1)
+case "$out" in
+    *"-v $TMP/extra:/data:ro"*) ok "--volume passes through" ;;
+    *) bad "--volume" "got: $out" ;;
+esac
+
+reset
+mkdir -p "$TMP/extra"
+out=$(cd "$TMP/proj" && RUN_WRAPPER -v "$TMP/extra:/data" 2>/dev/null | tail -1)
+case "$out" in
+    *"-v $TMP/extra:/data"*) ok "-v short alias" ;;
+    *) bad "-v" "got: $out" ;;
+esac
+
+# Repeatable.
+reset
+mkdir -p "$TMP/extra" "$TMP/extra2"
+out=$(cd "$TMP/proj" && RUN_WRAPPER -v "$TMP/extra:/a" -v "$TMP/extra2:/b:ro" 2>/dev/null | tail -1)
+case "$out" in
+    *"-v $TMP/extra:/a"*"-v $TMP/extra2:/b:ro"*) ok "-v repeatable preserves order" ;;
+    *) bad "-v repeat" "got: $out" ;;
+esac
+
+# = form.
+reset
+mkdir -p "$TMP/extra"
+out=$(cd "$TMP/proj" && RUN_WRAPPER "--volume=$TMP/extra:/data" 2>/dev/null | tail -1)
+case "$out" in
+    *"-v $TMP/extra:/data"*) ok "--volume=SPEC form" ;;
+    *) bad "--volume=" "got: $out" ;;
+esac
+
+# Missing arg → die.
+reset
+out=$( { cd "$TMP/proj" && RUN_WRAPPER --volume; } 2>&1 | tail -1 || true)
+case "$out" in
+    *"requires an argument"*) ok "--volume without arg errors out" ;;
+    *) bad "--volume missing arg" "got: $out" ;;
+esac
+
+# --volume after `--` is a literal claude arg.
+reset
+mkdir -p "$TMP/extra"
+out=$(cd "$TMP/proj" && RUN_WRAPPER -- --volume "$TMP/extra:/data" 2>/dev/null | tail -1)
+case "$out" in
+    *"-v $TMP/extra:/data"*) bad "--volume after -- was consumed" "got: $out" ;;
+    *claude*--volume*) ok "--volume after -- passes through" ;;
+    *) bad "after-dashdash" "got: $out" ;;
+esac
+
+# .isoclaude/mounts file still works (refactor regression check).
+reset
+mkdir -p "$TMP/proj/.isoclaude" "$TMP/extra"
+cat > "$TMP/proj/.isoclaude/mounts" <<EOF
+# comment
+$TMP/extra:/data:ro
+
+$TMP/extra:/scratch
+EOF
+RUN_FLAGS=()
+_add_project_mounts "$TMP/proj/.isoclaude/mounts"
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    *"-v $TMP/extra:/data:ro"*"-v $TMP/extra:/scratch"*) ok ".isoclaude/mounts: entries emitted in order, comments skipped" ;;
+    *) bad "mounts file emission" "flags: $flags" ;;
+esac
+
+# Project mounts file + CLI -v: both appear, file first.
+reset
+mkdir -p "$TMP/proj/.isoclaude" "$TMP/extra" "$TMP/cli-extra"
+echo "$TMP/extra:/from-file" > "$TMP/proj/.isoclaude/mounts"
+out=$(cd "$TMP/proj" && RUN_WRAPPER -v "$TMP/cli-extra:/from-cli" 2>/dev/null | tail -1)
+case "$out" in
+    *"-v $TMP/extra:/from-file"*"-v $TMP/cli-extra:/from-cli"*) ok "project mounts file + CLI -v, file first" ;;
+    *) bad "file + CLI combo" "got: $out" ;;
+esac
+
+# Help mentions --volume and .isoclaude/mounts.
+out="$(cmd_help)"
+for tok in "--volume" ".isoclaude/mounts"; do
+    case "$out" in
+        *"$tok"*) ok "help mentions '$tok'" ;;
+        *) bad "help missing '$tok'" ;;
+    esac
+done
+
+#-----------------------------------------------------------------------
 printf '\n\033[1mPhase 6: %d passed, %d failed\033[0m\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
