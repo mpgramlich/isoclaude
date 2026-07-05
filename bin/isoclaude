@@ -433,7 +433,13 @@ compose_run_flags() {
         fi
     fi
     _add_mount "$proj_cfg:/home/claude/.claude.json"
-    _macos_auth_check
+    # Skip the host-keychain bridge in --own-auth mode. The container
+    # will manage its own credentials via `/login`, and the file it
+    # writes to /home/claude/.claude/.credentials.json must NOT be
+    # clobbered by a stale keychain snapshot.
+    if [ "${OWN_AUTH:-0}" != "1" ]; then
+        _macos_auth_check
+    fi
 
     # Persisted-mode argv file. Mounted ro from the host; rewritten by
     # the wrapper before each `container start`. Only relevant when
@@ -663,6 +669,24 @@ _exec_in_sandbox() {
         KEEP=1
     fi
 
+    # --own-auth stickiness: a marker file at .isoclaude/local/own-auth
+    # means the user previously chose container-managed auth for this
+    # PWD, so we honor that on every subsequent run without them having
+    # to re-pass the flag. Remove the marker to switch back to the host
+    # keychain bridge (or run `rm .isoclaude/local/own-auth`).
+    local _cfg_root_early="${PROJECT_ROOT:-$(cd -P "$PWD" 2>/dev/null && pwd -P || printf '%s' "$PWD")}"
+    if [ -f "$_cfg_root_early/.isoclaude/local/own-auth" ]; then
+        OWN_AUTH=1
+    fi
+    # If --own-auth was passed this invocation, write the marker so
+    # future runs auto-detect it. Only do this when we're going to run
+    # something (not e.g. dry-run at the very top).
+    if [ "${OWN_AUTH:-0}" = "1" ] && [ ! -f "$_cfg_root_early/.isoclaude/local/own-auth" ]; then
+        mkdir -p "$_cfg_root_early/.isoclaude/local" 2>/dev/null || true
+        : > "$_cfg_root_early/.isoclaude/local/own-auth" 2>/dev/null || true
+        log "recorded own-auth marker at $_cfg_root_early/.isoclaude/local/own-auth"
+    fi
+
     compose_run_flags
 
     # ---- EXEC into a running container -----------------------------------
@@ -696,7 +720,7 @@ _exec_in_sandbox() {
             printf '%s start -a -i %q\n' "$runtime" "$cname"
             return 0
         fi
-        _spawn_auth_refresher "$runtime" "$cname"
+        [ "${OWN_AUTH:-0}" = "1" ] || _spawn_auth_refresher "$runtime" "$cname"
         exec "$runtime" start -a -i "$cname"
     fi
 
@@ -724,7 +748,7 @@ _exec_in_sandbox() {
             printf '\n'
             return 0
         fi
-        _spawn_auth_refresher "$runtime" "$cname"
+        [ "${OWN_AUTH:-0}" = "1" ] || _spawn_auth_refresher "$runtime" "$cname"
         # No CMD args here — entrypoint reads them from the bind-mounted
         # cmd file and execs claude with them.
         exec "$runtime" run "${RUN_FLAGS[@]}" "$image"
@@ -737,7 +761,7 @@ _exec_in_sandbox() {
         printf '\n'
         return 0
     fi
-    _spawn_auth_refresher "$runtime"
+    [ "${OWN_AUTH:-0}" = "1" ] || _spawn_auth_refresher "$runtime"
     exec "$runtime" run "${RUN_FLAGS[@]}" "$image" "$entry" "$@"
 }
 
@@ -1621,6 +1645,15 @@ GLOBAL FLAGS
                             `isoclaude rm`.
     --cpus N                CPU cap (docker syntax: "2", "0.5", "1.5").
                             Same create-only caveat as --memory.
+    --own-auth              Skip the macOS keychain → container
+                            credentials bridge. The container manages
+                            its own OAuth tokens: run `/login` inside
+                            claude, open the printed URL in your host
+                            browser, and the container captures and
+                            refreshes its own tokens from that point
+                            on. Sticky per-PWD via a marker file at
+                            .isoclaude/local/own-auth — remove the
+                            marker to switch back to the host bridge.
 
 ENVIRONMENT
     ISOCLAUDE_HOME           Override the install dir (default: ~/.isoclaude).
@@ -1630,6 +1663,7 @@ ENVIRONMENT
     ISOCLAUDE_YOLO=1         Same as passing --yolo on every invocation.
     ISOCLAUDE_KEEP=1         Same as passing --keep on every invocation.
     ISOCLAUDE_OFFLINE=1      Same as passing --offline on every invocation.
+    ISOCLAUDE_OWN_AUTH=1     Same as passing --own-auth on every invocation.
     ISOCLAUDE_MEMORY         Default for --memory (e.g. "8g").
     ISOCLAUDE_CPUS           Default for --cpus (e.g. "4").
 EOF
@@ -1661,9 +1695,15 @@ main() {
     #                          is expanded to $HOME.
     #   --memory / -m N      → MEMORY=N (docker syntax: 4g, 512m, bytes).
     #   --cpus N             → CPUS=N (docker syntax: 2, 0.5, 1.5).
+    #   --own-auth           → OWN_AUTH=1 (opt out of the host-keychain
+    #                          bridge; container manages its own tokens
+    #                          via `/login` inside claude). Sticky across
+    #                          restarts via a marker file at
+    #                          .isoclaude/local/own-auth.
     YOLO="${ISOCLAUDE_YOLO:-0}"
     KEEP="${ISOCLAUDE_KEEP:-0}"
     OFFLINE="${ISOCLAUDE_OFFLINE:-0}"
+    OWN_AUTH="${ISOCLAUDE_OWN_AUTH:-0}"
     MEMORY="${ISOCLAUDE_MEMORY:-}"
     CPUS="${ISOCLAUDE_CPUS:-}"
     PUBLISH=()
@@ -1677,6 +1717,7 @@ main() {
                 --keep|-k)    KEEP=1; i=$((i+1)); continue ;;
                 --no-keep)    KEEP=0; FORCE_EPHEMERAL=1; i=$((i+1)); continue ;;
                 --offline|-o) OFFLINE=1; i=$((i+1)); continue ;;
+                --own-auth)   OWN_AUTH=1; i=$((i+1)); continue ;;
                 --publish|-p)
                     i=$((i+1))
                     if [ "$i" -gt "$#" ]; then

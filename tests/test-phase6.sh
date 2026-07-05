@@ -120,6 +120,7 @@ reset() {
     YOLO=0
     KEEP=0
     OFFLINE=0
+    OWN_AUTH=0
     FORCE_EPHEMERAL=0
     PROJECT_ROOT=""
     unset FAKE_OFFLINE_NET_EXISTS
@@ -994,6 +995,106 @@ esac
 # Help mentions --volume and .isoclaude/mounts.
 out="$(cmd_help)"
 for tok in "--volume" ".isoclaude/mounts"; do
+    case "$out" in
+        *"$tok"*) ok "help mentions '$tok'" ;;
+        *) bad "help missing '$tok'" ;;
+    esac
+done
+
+#-----------------------------------------------------------------------
+section "Container-managed auth (--own-auth / ISOCLAUDE_OWN_AUTH / sticky marker)"
+
+# --own-auth flag → OWN_AUTH=1 after main() parse.
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER --own-auth 2>&1)
+# When OWN_AUTH=1 in a fresh dir, the marker is created and a log line
+# tells the user so.
+case "$out" in
+    *"recorded own-auth marker"*) ok "--own-auth logs marker creation on first use" ;;
+    *) bad "no marker-creation log" "got: $out" ;;
+esac
+[ -f "$TMP/proj/.isoclaude/local/own-auth" ] && ok "--own-auth writes .isoclaude/local/own-auth marker" \
+    || bad "marker file missing"
+
+# ISOCLAUDE_OWN_AUTH=1 env var takes effect the same way.
+reset
+out=$(cd "$TMP/proj" && ISOCLAUDE_OWN_AUTH=1 RUN_WRAPPER 2>&1)
+[ -f "$TMP/proj/.isoclaude/local/own-auth" ] && ok "ISOCLAUDE_OWN_AUTH=1 env writes marker" \
+    || bad "env-var marker missing"
+
+# Marker is sticky: pre-existing marker → OWN_AUTH auto-detected, no
+# log line (already recorded), _macos_auth_check skipped.
+reset
+mkdir -p "$TMP/proj/.isoclaude/local"
+: > "$TMP/proj/.isoclaude/local/own-auth"
+out=$(cd "$TMP/proj" && RUN_WRAPPER 2>&1)
+case "$out" in
+    *"recorded own-auth marker"*) bad "sticky marker re-triggered creation log" "got: $out" ;;
+    *) ok "sticky marker: no re-creation log" ;;
+esac
+
+# Guard actually skips _macos_auth_check when OWN_AUTH=1. We check by
+# invoking compose_run_flags directly with OWN_AUTH toggled and looking
+# for the "no claude credentials" warn that the check emits when
+# keychain-less.
+reset
+OWN_AUTH=1
+RUN_FLAGS=()
+out=$(compose_run_flags 2>&1 || true)
+case "$out" in
+    *"no claude credentials"*) bad "OWN_AUTH=1 still triggered _macos_auth_check warn" "got: $out" ;;
+    *) ok "OWN_AUTH=1 skips _macos_auth_check" ;;
+esac
+
+# Control: same test but OWN_AUTH=0 → the check runs. On the test
+# harness there's no macOS `security` CLI on PATH, so the check
+# returns non-warn (rc=2 platform mismatch). That's fine — we just
+# need to confirm control-path runs *something* (mount the credential
+# stub path or emit any log). Easiest: trace and count invocations.
+reset
+OWN_AUTH=0
+out=$(compose_run_flags 2>&1 || true)
+# On non-Darwin the check is a no-op (rc=2), which is fine — but we
+# want to be sure the guard didn't skip it. We already covered "guard
+# fires when OWN_AUTH=1"; the mirror is implicit from the source read.
+# Instead, verify by grepping the wrapper's own conditional so a
+# future refactor that drops it fails loudly:
+grep -q 'if \[ "\${OWN_AUTH:-0}" != "1" \]; then' "$WRAPPER" \
+    && ok "compose_run_flags has OWN_AUTH guard around _macos_auth_check" \
+    || bad "guard missing in wrapper source"
+
+# All three _spawn_auth_refresher call sites should be guarded on OWN_AUTH.
+n_refresher_calls=$(grep -c '_spawn_auth_refresher' "$WRAPPER")
+n_guarded_calls=$(grep -c '\[ "${OWN_AUTH:-0}" = "1" \] || _spawn_auth_refresher' "$WRAPPER")
+# 3 call sites in _exec_in_sandbox + 1 definition + 1-2 comment refs.
+# We only care that every *call* is guarded — count guarded lines vs
+# the sum of exec-branch call sites (3).
+[ "$n_guarded_calls" -eq 3 ] \
+    && ok "all 3 _spawn_auth_refresher call sites are OWN_AUTH-guarded" \
+    || bad "expected 3 guarded refresher calls, got $n_guarded_calls (total refs: $n_refresher_calls)"
+
+# --own-auth after `--` is a literal claude arg.
+reset
+out=$(cd "$TMP/proj" && RUN_WRAPPER -- --own-auth 2>/dev/null | tail -1)
+case "$out" in
+    *"claude"*"--own-auth"*) ok "--own-auth after -- passes through to claude" ;;
+    *) bad "after-dashdash" "got: $out" ;;
+esac
+
+# --own-auth + --keep: marker AND persistence work together.
+reset
+export FAKE_STATE=""
+out=$(cd "$TMP/proj" && RUN_WRAPPER --own-auth --keep 2>/dev/null | tail -1)
+case "$out" in
+    *"--name isoclaude-"*) ok "--own-auth + --keep both take effect" ;;
+    *) bad "--own-auth + --keep" "got: $out" ;;
+esac
+[ -f "$TMP/proj/.isoclaude/local/own-auth" ] && ok "--own-auth + --keep still writes marker" \
+    || bad "combined path skipped marker write"
+
+# Help mentions --own-auth and its env var.
+out="$(cmd_help)"
+for tok in "--own-auth" "ISOCLAUDE_OWN_AUTH" "/login"; do
     case "$out" in
         *"$tok"*) ok "help mentions '$tok'" ;;
         *) bad "help missing '$tok'" ;;
