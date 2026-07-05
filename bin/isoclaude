@@ -465,6 +465,13 @@ compose_run_flags() {
     _add "-e" "HOST_GID=$(id -g)"
     _add "-e" "TERM"
     _add "-e" "COLORTERM"
+    # Turn off claude's xterm mouse-tracking (CSI ?1000/?1002/?1006). With
+    # mouse tracking on, every drag inside the pane is delivered to claude
+    # as an escape sequence, and the host terminal never sees a selection
+    # — so cmd-c has nothing to copy. DISABLE_MOUSE is claude-code's own
+    # documented escape hatch. Set to 0 in .isoclaude/env or on the host
+    # if you actually want mouse behavior inside claude.
+    _add "-e" "DISABLE_MOUSE=${DISABLE_MOUSE:-1}"
 
     # Project-level overlays: env vars, mounts, published ports.
     # local/ overrides the committed copy by being listed second (docker
