@@ -1188,6 +1188,48 @@ esac
 [ -f "$TMP/proj/.isoclaude/local/own-auth" ] && ok "--own-auth + --keep still writes marker" \
     || bad "combined path skipped marker write"
 
+# Credential isolation: OWN_AUTH=1 must overlay a per-project
+# credentials file on the shared ~/.claude mount, seeded as {} so
+# claude inside genuinely starts logged out.
+reset
+OWN_AUTH=1
+RUN_FLAGS=()
+compose_run_flags >/dev/null 2>&1 || true
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    *"$TMP/proj/.isoclaude/local/credentials.json:/home/claude/.claude/.credentials.json"*) \
+        ok "OWN_AUTH=1 overlays private credentials.json" ;;
+    *) bad "no creds overlay" "flags: $flags" ;;
+esac
+[ -f "$TMP/proj/.isoclaude/local/credentials.json" ] \
+    && ok "creds stub created on demand" || bad "creds stub missing"
+[ "$(cat "$TMP/proj/.isoclaude/local/credentials.json")" = "{}" ] \
+    && ok "creds stub is an empty JSON object" \
+    || bad "stub content wrong" "got: $(cat "$TMP/proj/.isoclaude/local/credentials.json")"
+
+# An existing (logged-in) creds file must NOT be overwritten by the stub.
+reset
+mkdir -p "$TMP/proj/.isoclaude/local"
+printf '{"claudeAiOauth":{"accessToken":"container-token"}}\n' \
+    > "$TMP/proj/.isoclaude/local/credentials.json"
+OWN_AUTH=1
+RUN_FLAGS=()
+compose_run_flags >/dev/null 2>&1 || true
+grep -q "container-token" "$TMP/proj/.isoclaude/local/credentials.json" \
+    && ok "existing container tokens preserved (no re-seed)" \
+    || bad "container tokens clobbered by stub"
+
+# Control: OWN_AUTH=0 → no overlay, shared file untouched.
+reset
+OWN_AUTH=0
+RUN_FLAGS=()
+compose_run_flags >/dev/null 2>&1 || true
+flags="${RUN_FLAGS[*]}"
+case "$flags" in
+    *":/home/claude/.claude/.credentials.json"*) bad "bridge mode emitted creds overlay" "flags: $flags" ;;
+    *) ok "bridge mode has no creds overlay" ;;
+esac
+
 # cmd_sync_auth refuses when the marker exists.
 reset
 mkdir -p "$TMP/proj/.isoclaude/local"

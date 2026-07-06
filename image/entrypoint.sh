@@ -77,4 +77,23 @@ if [ -r "$ARGS_FILE" ]; then
     eval "set -- $(cat "$ARGS_FILE")"
 fi
 
+# Interactive claude goes through the pty mouse filter: claude's TUI
+# enables xterm mouse-tracking unconditionally, which kills host-side
+# drag-to-select (in tmux and out). The filter runs claude under a pty
+# (so it still renders its TUI) and strips the mouse-enable sequences
+# from the output stream. Gated on:
+#   - the command actually being claude (bash/shell doesn't need it)
+#   - stdout being a TTY (claude -p pipelines shouldn't grow a pty)
+#   - ISOCLAUDE_MOUSE_FILTER != 0 (user opt-out for in-claude mouse)
+#   - the filter actually being installed (older images: fall through)
+case "${1:-}" in
+    claude)
+        if [ "${ISOCLAUDE_MOUSE_FILTER:-1}" != "0" ] && [ -t 1 ] \
+           && command -v script >/dev/null 2>&1 \
+           && [ -f /usr/local/lib/isoclaude/mouse-filter.js ]; then
+            exec gosu claude /usr/local/bin/isoclaude-pty-filter "$@"
+        fi
+        ;;
+esac
+
 exec gosu claude "$@"

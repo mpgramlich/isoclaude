@@ -10,11 +10,20 @@ FROM debian:trixie-slim
 ARG CLAUDE_VERSION
 RUN test -n "$CLAUDE_VERSION" || (echo "CLAUDE_VERSION build-arg is required" >&2; exit 1)
 
+# The gh apt source is registered BEFORE the nodesource setup script so
+# nodesource's internal `apt-get update` refreshes both lists in one
+# pass (saves a redundant update).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates curl git gosu gnupg openssh-client sudo \
+ && install -m 0755 -d /etc/apt/keyrings \
+ && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
  && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
- && apt-get install -y --no-install-recommends nodejs \
+ && apt-get install -y --no-install-recommends nodejs gh \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
 
@@ -39,7 +48,9 @@ RUN echo 'claude ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/claude \
 RUN git config --system --add safe.directory '*'
 
 COPY entrypoint.sh /usr/local/bin/isoclaude-entrypoint
-RUN chmod +x /usr/local/bin/isoclaude-entrypoint
+COPY mouse-filter.js /usr/local/lib/isoclaude/mouse-filter.js
+COPY pty-filter.sh /usr/local/bin/isoclaude-pty-filter
+RUN chmod +x /usr/local/bin/isoclaude-entrypoint /usr/local/bin/isoclaude-pty-filter
 
 ENV HOME=/home/claude
 LABEL isoclaude.claude_version="${CLAUDE_VERSION}"

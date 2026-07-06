@@ -99,9 +99,11 @@ ensure_iso_home() {
     local src
     src="$(script_dir)/../image"
     if [ -f "$src/Dockerfile.base" ] && [ -f "$src/entrypoint.sh" ]; then
-        local synced=0
-        _sync_if_diff "$src/Dockerfile.base" "$ISOCLAUDE_HOME/Dockerfile.base" && synced=1
-        _sync_if_diff "$src/entrypoint.sh"   "$ISOCLAUDE_HOME/entrypoint.sh"   && synced=1
+        local synced=0 f
+        for f in Dockerfile.base entrypoint.sh mouse-filter.js pty-filter.sh; do
+            [ -f "$src/$f" ] || continue
+            _sync_if_diff "$src/$f" "$ISOCLAUDE_HOME/$f" && synced=1
+        done
         [ "$synced" -eq 1 ] && log "synced $ISOCLAUDE_HOME from $src"
         return 0
     fi
@@ -433,11 +435,32 @@ compose_run_flags() {
         fi
     fi
     _add_mount "$proj_cfg:/home/claude/.claude.json"
-    # Skip the host-keychain bridge in --own-auth mode. The container
-    # will manage its own credentials via `/login`, and the file it
-    # writes to /home/claude/.claude/.credentials.json must NOT be
-    # clobbered by a stale keychain snapshot.
-    if [ "${OWN_AUTH:-0}" != "1" ]; then
+    # --own-auth: the container manages its own credentials. Skipping
+    # the keychain bridge (below) is NOT enough on its own, because
+    # ~/.claude is bind-mounted rw and SHARED — the container would
+    # still see (and refresh!) the host's tokens sitting in the shared
+    # ~/.claude/.credentials.json, and OAuth refresh rotation would
+    # invalidate the host's copy. So we overlay a per-project
+    # credentials file on top of the shared one. Seeded as an empty
+    # JSON object so claude inside genuinely has no tokens and prompts
+    # /login; from then on it reads/writes/refreshes only this file.
+    if [ "${OWN_AUTH:-0}" = "1" ]; then
+        local own_creds="$cfg_root/.isoclaude/local/credentials.json"
+        if [ ! -f "$own_creds" ]; then
+            mkdir -p "$cfg_root/.isoclaude/local" 2>/dev/null || true
+            if printf '{}\n' > "$own_creds" 2>/dev/null; then
+                chmod 600 "$own_creds" 2>/dev/null || true
+                log "own-auth: created private credential store at $own_creds (run /login inside claude)"
+            else
+                warn "own-auth: could not create $own_creds; container will see the SHARED host credentials"
+            fi
+        fi
+        if [ -f "$own_creds" ]; then
+            _add_mount "$own_creds:/home/claude/.claude/.credentials.json"
+        fi
+    else
+        # Host-keychain bridge (default mode): sync keychain → file so
+        # the shared ~/.claude/.credentials.json is fresh at launch.
         _macos_auth_check
     fi
 
@@ -471,17 +494,20 @@ compose_run_flags() {
     _add "-e" "HOST_GID=$(id -g)"
     _add "-e" "TERM"
     _add "-e" "COLORTERM"
-    # Turn off claude's xterm mouse-tracking (CSI ?1000/?1002/?1006). With
-    # mouse tracking on, every drag inside the pane is delivered to claude
-    # as an escape sequence, and the host terminal never sees a selection
-    # — so cmd-c has nothing to copy. DISABLE_MOUSE is claude-code's own
-    # documented escape hatch. Set to 0 in .isoclaude/env or on the host
-    # if you actually want mouse behavior inside claude.
-    # NB: like all -e env values, this is baked into the container at
-    # CREATE time. For an existing persistent --keep container, changing
-    # DISABLE_MOUSE here has no effect until you `isoclaude rm` and
-    # re-create.
+    # claude's TUI enables xterm mouse-tracking (CSI ?1000/?1002/?1003/
+    # ?1006) unconditionally, which makes the host terminal deliver every
+    # drag to claude instead of selecting text — so cmd-c has nothing to
+    # copy. Empirically (probed v2.1.201 in-container), the DISABLE_MOUSE
+    # env var does NOT suppress these sequences, so the real fix is the
+    # entrypoint's pty filter (isoclaude-pty-filter) which strips the
+    # mouse-enable sequences from claude's output stream. We still pass
+    # DISABLE_MOUSE in case a future claude version honors it, and
+    # ISOCLAUDE_MOUSE_FILTER=0 lets users opt back into in-claude mouse
+    # behavior (disables the filter).
+    # NB: like all -e env values, these are baked into the container at
+    # CREATE time — `isoclaude rm` + re-create to change them.
     _add "-e" "DISABLE_MOUSE=${DISABLE_MOUSE:-1}"
+    _add "-e" "ISOCLAUDE_MOUSE_FILTER=${ISOCLAUDE_MOUSE_FILTER:-1}"
 
     # Project-level overlays: env vars, mounts, published ports.
     # local/ overrides the committed copy by being listed second (docker
@@ -679,6 +705,12 @@ _exec_in_sandbox() {
     # to return to the host keychain bridge.
     local _cfg_root_early="${PROJECT_ROOT:-$(cd -P "$PWD" 2>/dev/null && pwd -P || printf '%s' "$PWD")}"
     if [ -f "$_cfg_root_early/.isoclaude/local/own-auth" ]; then
+        # Make sticky activation visible — a marker left behind by an
+        # earlier --own-auth run silently flipping auth mode is
+        # impossible to debug otherwise.
+        if [ "${OWN_AUTH:-0}" != "1" ]; then
+            log "own-auth mode (marker: $_cfg_root_early/.isoclaude/local/own-auth) — run /login inside claude, or delete the marker + .isoclaude/local/credentials.json for host auth"
+        fi
         OWN_AUTH=1
     fi
     # Write the marker on any --own-auth invocation (including dry-run,
@@ -1680,15 +1712,18 @@ GLOBAL FLAGS
                             `isoclaude rm`.
     --cpus N                CPU cap (docker syntax: "2", "0.5", "1.5").
                             Same create-only caveat as --memory.
-    --own-auth              Skip the macOS keychain → container
-                            credentials bridge. The container manages
-                            its own OAuth tokens: run `/login` inside
-                            claude, open the printed URL in your host
-                            browser, and the container captures and
-                            refreshes its own tokens from that point
-                            on. Sticky per-PWD via a marker file at
+    --own-auth              Give the container its OWN credential store
+                            instead of the shared host one. A private
+                            file at .isoclaude/local/credentials.json
+                            is overlaid on ~/.claude/.credentials.json
+                            inside the container, and the macOS
+                            keychain → container bridge is skipped.
+                            Run `/login` inside claude once; tokens are
+                            captured and refreshed per-project from
+                            then on (shared across ephemeral runs too).
+                            Sticky per-PWD via a marker file at
                             .isoclaude/local/own-auth — remove the
-                            marker to switch back to the host bridge.
+                            marker AND credentials.json to switch back.
 
 ENVIRONMENT
     ISOCLAUDE_HOME           Override the install dir (default: ~/.isoclaude).
