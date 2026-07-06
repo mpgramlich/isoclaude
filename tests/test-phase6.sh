@@ -1002,6 +1002,61 @@ for tok in "--volume" ".isoclaude/mounts"; do
 done
 
 #-----------------------------------------------------------------------
+section "Create-only flags don't leak into start/exec dispatch"
+# Regression guard for the entire create-only-flag family: --memory,
+# --cpus, --volume, --publish, and DISABLE_MOUSE are baked into the
+# container at CREATE time. `container start` and `container exec` do
+# NOT accept -m / --cpus / -v / -p / -e as run-time overrides. If the
+# dispatcher ever started forwarding compose_run_flags to those
+# branches, we'd emit invalid commands to the runtime. Pin the
+# expected shape.
+#
+# All of the assertions here also implicitly cover DISABLE_MOUSE — its
+# passthrough happens via `-e` inside compose_run_flags, alongside
+# TERM/COLORTERM, and the start/exec paths bypass the whole flag list.
+
+reset
+KEEP=1
+mkdir -p "$TMP/proj/extra"
+export FAKE_STATE="stopped"
+_prepare
+# Put a full create-flag stack in play.
+MEMORY=4g CPUS=2 \
+    VOLUME=("$TMP/proj/extra:/data") \
+    PUBLISH=(8080) \
+    out="$(_exec_in_sandbox docker claude 2>/dev/null | tail -1)"
+case "$out" in
+    *"docker start -a -i isoclaude-"*) ok "stopped-dispatch stays as start -a -i" ;;
+    *) bad "stopped dispatch shape drifted" "got: $out" ;;
+esac
+for tok in "-m " "--cpus" "-p " "-v " "DISABLE_MOUSE"; do
+    case "$out" in
+        *"$tok"*) bad "start branch leaked $tok" "got: $out" ;;
+        *) ok "start branch omits '$tok'" ;;
+    esac
+done
+
+reset
+KEEP=1
+mkdir -p "$TMP/proj/extra"
+export FAKE_STATE="running"
+_prepare
+MEMORY=8g CPUS=4 \
+    VOLUME=("$TMP/proj/extra:/data") \
+    PUBLISH=(9000) \
+    out="$(_exec_in_sandbox docker claude 2>/dev/null | tail -1)"
+case "$out" in
+    *"docker exec"*"isoclaude-"*claude*) ok "running-dispatch stays as exec <name> claude ..." ;;
+    *) bad "running dispatch shape drifted" "got: $out" ;;
+esac
+for tok in "-m " "--cpus" "-p " "-v " "DISABLE_MOUSE"; do
+    case "$out" in
+        *"$tok"*) bad "exec branch leaked $tok" "got: $out" ;;
+        *) ok "exec branch omits '$tok'" ;;
+    esac
+done
+
+#-----------------------------------------------------------------------
 section "Container-managed auth (--own-auth / ISOCLAUDE_OWN_AUTH / sticky marker)"
 
 # --own-auth flag → OWN_AUTH=1 after main() parse.
@@ -1033,45 +1088,86 @@ case "$out" in
     *) ok "sticky marker: no re-creation log" ;;
 esac
 
-# Guard actually skips _macos_auth_check when OWN_AUTH=1. We check by
-# invoking compose_run_flags directly with OWN_AUTH toggled and looking
-# for the "no claude credentials" warn that the check emits when
-# keychain-less.
+# Guard actually skips _macos_auth_check when OWN_AUTH=1. Shadow the
+# function with a probe that writes to a marker file, then verify
+# whether the probe fires. This is observable regardless of whether the
+# host keychain has a real entry (the previous "grep for warn"
+# implementation passed vacuously on any logged-in dev machine).
 reset
+_macos_auth_check__real() { _macos_auth_check "$@"; }
+_macos_auth_check() { echo "auth-check-fired" >> "$TMP/probe"; }
+: > "$TMP/probe"
 OWN_AUTH=1
 RUN_FLAGS=()
-out=$(compose_run_flags 2>&1 || true)
-case "$out" in
-    *"no claude credentials"*) bad "OWN_AUTH=1 still triggered _macos_auth_check warn" "got: $out" ;;
-    *) ok "OWN_AUTH=1 skips _macos_auth_check" ;;
-esac
+compose_run_flags >/dev/null 2>&1 || true
+[ ! -s "$TMP/probe" ] && ok "OWN_AUTH=1 skips _macos_auth_check (probe not called)" \
+    || bad "OWN_AUTH=1 called _macos_auth_check" "probe: $(cat "$TMP/probe")"
 
-# Control: same test but OWN_AUTH=0 → the check runs. On the test
-# harness there's no macOS `security` CLI on PATH, so the check
-# returns non-warn (rc=2 platform mismatch). That's fine — we just
-# need to confirm control-path runs *something* (mount the credential
-# stub path or emit any log). Easiest: trace and count invocations.
+# Control: OWN_AUTH=0 → probe fires.
 reset
+_macos_auth_check() { echo "auth-check-fired" >> "$TMP/probe"; }
+: > "$TMP/probe"
 OWN_AUTH=0
-out=$(compose_run_flags 2>&1 || true)
-# On non-Darwin the check is a no-op (rc=2), which is fine — but we
-# want to be sure the guard didn't skip it. We already covered "guard
-# fires when OWN_AUTH=1"; the mirror is implicit from the source read.
-# Instead, verify by grepping the wrapper's own conditional so a
-# future refactor that drops it fails loudly:
-grep -q 'if \[ "\${OWN_AUTH:-0}" != "1" \]; then' "$WRAPPER" \
-    && ok "compose_run_flags has OWN_AUTH guard around _macos_auth_check" \
-    || bad "guard missing in wrapper source"
+RUN_FLAGS=()
+compose_run_flags >/dev/null 2>&1 || true
+[ -s "$TMP/probe" ] && ok "OWN_AUTH=0 does invoke _macos_auth_check" \
+    || bad "OWN_AUTH=0 skipped the check"
+# Restore the real function so later tests see normal behavior.
+unset -f _macos_auth_check 2>/dev/null || true
+# Redefine from the wrapper source by re-sourcing (idempotent).
+# shellcheck disable=SC1090
+. "$WRAPPER" 2>/dev/null || true
 
-# All three _spawn_auth_refresher call sites should be guarded on OWN_AUTH.
-n_refresher_calls=$(grep -c '_spawn_auth_refresher' "$WRAPPER")
+# _spawn_auth_refresher guard: shadow it and drive _exec_in_sandbox
+# through both the run-persistent and run-ephemeral paths.
+reset
+_spawn_auth_refresher() { echo "refresher-fired" >> "$TMP/probe"; }
+: > "$TMP/probe"
+OWN_AUTH=1
+KEEP=1
+export FAKE_STATE=""
+_prepare
+_exec_in_sandbox docker claude >/dev/null 2>&1 || true
+[ ! -s "$TMP/probe" ] && ok "OWN_AUTH=1 skips _spawn_auth_refresher on persistent-run branch" \
+    || bad "refresher fired on persistent-run despite OWN_AUTH=1"
+
+reset
+_spawn_auth_refresher() { echo "refresher-fired" >> "$TMP/probe"; }
+: > "$TMP/probe"
+OWN_AUTH=1
+KEEP=0
+export FAKE_STATE=""
+_prepare
+_exec_in_sandbox docker claude >/dev/null 2>&1 || true
+[ ! -s "$TMP/probe" ] && ok "OWN_AUTH=1 skips _spawn_auth_refresher on ephemeral-run branch" \
+    || bad "refresher fired on ephemeral-run despite OWN_AUTH=1"
+
+reset
+_spawn_auth_refresher() { echo "refresher-fired" >> "$TMP/probe"; }
+: > "$TMP/probe"
+OWN_AUTH=1
+KEEP=1
+export FAKE_STATE="stopped"
+_prepare
+_exec_in_sandbox docker claude >/dev/null 2>&1 || true
+[ ! -s "$TMP/probe" ] && ok "OWN_AUTH=1 skips _spawn_auth_refresher on start branch" \
+    || bad "refresher fired on start-branch despite OWN_AUTH=1"
+
+# Belt-and-braces: verify all 3 refresher call sites are guarded in the
+# wrapper source. The shadow tests above rely on the dispatcher NOT
+# calling the (shadowed) real function under OWN_AUTH=1; that's dry-run-
+# safe. A source-level regression check pins the guard shape too, so a
+# future refactor that removes a guard fails loudly rather than
+# vacuously.
 n_guarded_calls=$(grep -c '\[ "${OWN_AUTH:-0}" = "1" \] || _spawn_auth_refresher' "$WRAPPER")
-# 3 call sites in _exec_in_sandbox + 1 definition + 1-2 comment refs.
-# We only care that every *call* is guarded — count guarded lines vs
-# the sum of exec-branch call sites (3).
 [ "$n_guarded_calls" -eq 3 ] \
-    && ok "all 3 _spawn_auth_refresher call sites are OWN_AUTH-guarded" \
-    || bad "expected 3 guarded refresher calls, got $n_guarded_calls (total refs: $n_refresher_calls)"
+    && ok "wrapper source has 3 OWN_AUTH-guarded _spawn_auth_refresher calls" \
+    || bad "expected 3 guarded refresher calls in source, got $n_guarded_calls"
+
+# Restore real functions.
+unset -f _spawn_auth_refresher 2>/dev/null || true
+# shellcheck disable=SC1090
+. "$WRAPPER" 2>/dev/null || true
 
 # --own-auth after `--` is a literal claude arg.
 reset
@@ -1091,6 +1187,44 @@ case "$out" in
 esac
 [ -f "$TMP/proj/.isoclaude/local/own-auth" ] && ok "--own-auth + --keep still writes marker" \
     || bad "combined path skipped marker write"
+
+# cmd_sync_auth refuses when the marker exists.
+reset
+mkdir -p "$TMP/proj/.isoclaude/local"
+: > "$TMP/proj/.isoclaude/local/own-auth"
+# cmd_sync_auth calls die() which exits nonzero and prints to stderr.
+# We can't run it directly in the same shell (would kill the test);
+# invoke via subshell.
+out=$( ( cd "$TMP/proj" && cmd_sync_auth ) 2>&1 || true )
+case "$out" in
+    *"own-auth mode"*"marker"*) ok "cmd_sync_auth refuses when marker exists" ;;
+    *) bad "cmd_sync_auth clobbered without refusal" "got: $out" ;;
+esac
+
+# cmd_sync_auth --force bypasses the marker refusal.
+reset
+mkdir -p "$TMP/proj/.isoclaude/local"
+: > "$TMP/proj/.isoclaude/local/own-auth"
+out=$( ( cd "$TMP/proj" && cmd_sync_auth --force ) 2>&1 || true )
+case "$out" in
+    *"own-auth mode"*"marker"*) bad "--force did not bypass marker check" "got: $out" ;;
+    *) ok "cmd_sync_auth --force bypasses marker check" ;;
+esac
+
+# _doctor_auth is marker-aware: reports own-auth mode instead of the
+# "no host login found" advice.
+reset
+mkdir -p "$TMP/proj/.isoclaude/local"
+: > "$TMP/proj/.isoclaude/local/own-auth"
+out=$( ( cd "$TMP/proj" && _doctor_auth ) 2>&1 || true )
+case "$out" in
+    *"own-auth mode active"*|*"--own-auth mode active"*) ok "_doctor_auth reports own-auth mode when marker present" ;;
+    *) bad "doctor missed the marker" "got: $out" ;;
+esac
+case "$out" in
+    *"no host login found"*) bad "doctor still gave stale 'host login' advice" "got: $out" ;;
+    *) ok "doctor suppresses irrelevant host-keychain diagnostics under own-auth" ;;
+esac
 
 # Help mentions --own-auth and its env var.
 out="$(cmd_help)"

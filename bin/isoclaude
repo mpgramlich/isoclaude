@@ -477,6 +477,10 @@ compose_run_flags() {
     # — so cmd-c has nothing to copy. DISABLE_MOUSE is claude-code's own
     # documented escape hatch. Set to 0 in .isoclaude/env or on the host
     # if you actually want mouse behavior inside claude.
+    # NB: like all -e env values, this is baked into the container at
+    # CREATE time. For an existing persistent --keep container, changing
+    # DISABLE_MOUSE here has no effect until you `isoclaude rm` and
+    # re-create.
     _add "-e" "DISABLE_MOUSE=${DISABLE_MOUSE:-1}"
 
     # Project-level overlays: env vars, mounts, published ports.
@@ -671,20 +675,24 @@ _exec_in_sandbox() {
 
     # --own-auth stickiness: a marker file at .isoclaude/local/own-auth
     # means the user previously chose container-managed auth for this
-    # PWD, so we honor that on every subsequent run without them having
-    # to re-pass the flag. Remove the marker to switch back to the host
-    # keychain bridge (or run `rm .isoclaude/local/own-auth`).
+    # PWD, so we honor that on every subsequent run. Delete the marker
+    # to return to the host keychain bridge.
     local _cfg_root_early="${PROJECT_ROOT:-$(cd -P "$PWD" 2>/dev/null && pwd -P || printf '%s' "$PWD")}"
     if [ -f "$_cfg_root_early/.isoclaude/local/own-auth" ]; then
         OWN_AUTH=1
     fi
-    # If --own-auth was passed this invocation, write the marker so
-    # future runs auto-detect it. Only do this when we're going to run
-    # something (not e.g. dry-run at the very top).
+    # Write the marker on any --own-auth invocation (including dry-run,
+    # matching how _write_persist_cmd writes cmd file: sticky state is
+    # part of what dry-run should show you). Only log on actual success
+    # — a readonly local/ shouldn't be reported as recorded when it
+    # wasn't.
     if [ "${OWN_AUTH:-0}" = "1" ] && [ ! -f "$_cfg_root_early/.isoclaude/local/own-auth" ]; then
         mkdir -p "$_cfg_root_early/.isoclaude/local" 2>/dev/null || true
-        : > "$_cfg_root_early/.isoclaude/local/own-auth" 2>/dev/null || true
-        log "recorded own-auth marker at $_cfg_root_early/.isoclaude/local/own-auth"
+        if : > "$_cfg_root_early/.isoclaude/local/own-auth" 2>/dev/null; then
+            log "recorded own-auth marker at $_cfg_root_early/.isoclaude/local/own-auth"
+        else
+            warn "could not write own-auth marker at $_cfg_root_early/.isoclaude/local/own-auth (readonly?); sticky mode won't survive next run"
+        fi
     fi
 
     compose_run_flags
@@ -953,6 +961,19 @@ cmd_sync_auth() {
         || die "sync-auth is only needed on macOS (other platforms store credentials on disk)"
     command -v security >/dev/null 2>&1 \
         || die "macOS \`security\` CLI not found"
+
+    # If the PWD is in --own-auth mode, the container is authoritative
+    # for ~/.claude/.credentials.json — writing a keychain snapshot on
+    # top would clobber whatever tokens the container has refreshed.
+    # Refuse rather than silently overwrite. `--force` bypasses.
+    local force=0
+    case "${1:-}" in --force|-f) force=1 ;; esac
+    local _sa_root
+    _sa_root="$(cd -P "$PWD" 2>/dev/null && pwd -P)" || _sa_root="$PWD"
+    _sa_root="$(cd "$_sa_root" && project_root 2>/dev/null || printf '%s' "$_sa_root")"
+    if [ "$force" != "1" ] && [ -f "$_sa_root/.isoclaude/local/own-auth" ]; then
+        die "this PWD is in --own-auth mode (marker at $_sa_root/.isoclaude/local/own-auth); the container owns its credentials. Delete the marker and re-run to force a keychain sync, or pass --force."
+    fi
 
     local rc=0
     _macos_auth_refresh || rc=$?
@@ -1478,6 +1499,20 @@ _doctor_auth() {
     _doc_section "Auth & mounts"
     [ -d "$HOME/.claude" ]      && _doc_ok "~/.claude/ present"      || _doc_warn "~/.claude/ missing"
     [ -f "$HOME/.claude.json" ] && _doc_ok "~/.claude.json present" || _doc_warn "~/.claude.json missing — in-container claude will need /login"
+
+    # --own-auth mode: container owns credentials; host-side keychain
+    # diagnostics don't apply. Report the marker and skip the rest.
+    local _da_root
+    _da_root="$(cd -P "$PWD" 2>/dev/null && pwd -P)" || _da_root="$PWD"
+    _da_root="$(cd "$_da_root" && project_root 2>/dev/null || printf '%s' "$_da_root")"
+    if [ -f "$_da_root/.isoclaude/local/own-auth" ]; then
+        _doc_ok "--own-auth mode active (marker at $_da_root/.isoclaude/local/own-auth)"
+        _doc_note "container manages its own credentials via /login inside claude"
+        _doc_note "to return to host-keychain bridge: rm $_da_root/.isoclaude/local/own-auth"
+        [ -f "$HOME/.gitconfig" ] && _doc_ok "~/.gitconfig present"      || _doc_warn "~/.gitconfig missing — commits in sandbox won't have your name/email"
+        [ -d "$HOME/.ssh"      ] && _doc_ok "~/.ssh/ present"            || _doc_warn "~/.ssh/ missing — no git push over ssh from sandbox"
+        return
+    fi
 
     if [ "$(uname 2>/dev/null)" = "Darwin" ] && command -v security >/dev/null 2>&1; then
         local has_kc has_file
