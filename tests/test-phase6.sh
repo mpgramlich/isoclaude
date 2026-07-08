@@ -276,6 +276,20 @@ case "$out" in
     *) bad "exec missing -u claude" "got: $out" ;;
 esac
 
+# Attach sessions bypass the entrypoint, so the exec branch must carry
+# its own pty-filter routing. Tests run without a TTY, so the wrap must
+# NOT appear here (pins the -t 1 gate: claude -p pipelines through a
+# running container stay unwrapped)…
+case "$out" in
+    *"isoclaude-pty-filter"*) bad "exec wrapped filter without a TTY" "got: $out" ;;
+    *) ok "no filter wrap when stdout is not a TTY" ;;
+esac
+# …and a source-level check pins that the wrap exists for the TTY case
+# (can't fake -t 1 in a test harness).
+grep -q 'wrap=( sh -c .if \[ -x /usr/local/bin/isoclaude-pty-filter \]' "$WRAPPER" \
+    && ok "exec branch has TTY-gated pty-filter wrap in source" \
+    || bad "exec branch missing pty-filter wrap"
+
 #-----------------------------------------------------------------------
 section "_exec_in_sandbox dispatch — missing + KEEP=0 → run --rm (original)"
 

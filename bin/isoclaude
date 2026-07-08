@@ -738,13 +738,22 @@ _exec_in_sandbox() {
             exec_flags+=( -i )
         fi
         [ -t 1 ] && exec_flags+=( -t )
+        # Attach sessions bypass the entrypoint, so route interactive
+        # claude through the pty mouse filter here too (same gates the
+        # entrypoint uses). The in-container -x probe falls back to a
+        # plain exec against containers created from pre-filter images.
+        local wrap=()
+        if [ "$entry" = "claude" ] && [ -t 1 ] \
+           && [ "${ISOCLAUDE_MOUSE_FILTER:-1}" != "0" ]; then
+            wrap=( sh -c 'if [ -x /usr/local/bin/isoclaude-pty-filter ]; then exec /usr/local/bin/isoclaude-pty-filter "$@"; fi; exec "$@"' sh )
+        fi
         if [ -n "${ISOCLAUDE_DRY_RUN:-}" ]; then
             printf '%s exec' "$runtime"
-            printf ' %q' "${exec_flags[@]}" "$cname" "$entry" "$@"
+            printf ' %q' "${exec_flags[@]}" "$cname" "${wrap[@]}" "$entry" "$@"
             printf '\n'
             return 0
         fi
-        exec "$runtime" exec "${exec_flags[@]}" "$cname" "$entry" "$@"
+        exec "$runtime" exec "${exec_flags[@]}" "$cname" "${wrap[@]}" "$entry" "$@"
     fi
 
     # ---- START a stopped container ---------------------------------------
