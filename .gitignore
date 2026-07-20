@@ -1,5 +1,8 @@
-# Claude Code's session storage
-.claude/
+# Claude Code's session storage (project gates/providers are versioned)
+.claude/*
+!.claude/hooks/
+!.claude/providers/
+!.claude/settings.json
 
 # macOS
 .DS_Store

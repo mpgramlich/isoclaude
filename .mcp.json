@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "notes": {
+      "command": "python3",
+      "args": [
+        ".claude/providers/notes_mcp.py"
+      ]
+    }
+  }
+}

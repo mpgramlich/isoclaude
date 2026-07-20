@@ -1,0 +1,5 @@
+# BEGIN homeautomation notes MCP
+[mcp_servers.notes]
+command = "python3"
+args = [".codex/providers/notes_mcp.py"]
+# END homeautomation notes MCP
