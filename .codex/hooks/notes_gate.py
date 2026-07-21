@@ -44,6 +44,7 @@ CONFIG (all env, all optional)
 
 import os
 import re
+import shlex
 import sys
 import json
 import sqlite3
@@ -119,6 +120,69 @@ def _max_note_id(path):
         conn.close()
 
 
+def _matching_note_id(path, after_id, identity):
+    """Return a row matching this invocation's supplied note identity."""
+    body = identity.get("body", "")
+    if not body or not os.path.isfile(path):
+        return 0
+    allowed = ("author", "agent_id", "session", "project", "phase")
+    clauses = ["id > ?", "body = ?"]
+    args = [int(after_id), body]
+    for key in allowed:
+        if identity.get(key) is not None:
+            clauses.append(key + " = ?")
+            args.append(str(identity[key]))
+    conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=1.0)
+    try:
+        row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM notes WHERE "
+                           + " AND ".join(clauses), args).fetchone()
+        return int(row[0] or 0)
+    finally:
+        conn.close()
+
+
+def _note_identity(tool, tool_input, command):
+    """Extract exact note fields supplied by this invocation."""
+    keys = ("body", "author", "agent_id", "session", "project", "phase")
+    result = {k: str(tool_input[k]) for k in keys if tool_input.get(k) is not None}
+    if result.get("body"):
+        return result
+    if tool == "Bash" and command:
+        try:
+            words = shlex.split(command)
+            flags = {"--body": "body", "--author": "author",
+                     "--agent-id": "agent_id", "--session": "session",
+                     "--project": "project", "--phase": "phase"}
+            for i, word in enumerate(words):
+                for flag, key in flags.items():
+                    if word == flag and i + 1 < len(words):
+                        result[key] = words[i + 1]
+                    elif word.startswith(flag + "="):
+                        result[key] = word.split("=", 1)[1]
+        except (ValueError, TypeError):
+            pass
+    return result
+
+
+def _tool_succeeded(payload):
+    """Reject an explicitly failed PostToolUse result; tolerate absent metadata."""
+    result = payload.get("tool_response")
+    if result is None:
+        result = payload.get("tool_result", payload.get("tool_output"))
+    if isinstance(result, dict):
+        if result.get("is_error") is True or result.get("error"):
+            return False
+        code = result.get("exit_code")
+        if code is not None:
+            try:
+                return int(code) == 0
+            except (TypeError, ValueError):
+                return False
+        if str(result.get("status", "")).lower() in {"failed", "error"}:
+            return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Small IO helpers (all fail-soft)
 # ---------------------------------------------------------------------------
@@ -187,6 +251,7 @@ def _decide():
     sid = _sanitize_sid(payload.get("session_id", ""))
     tin = payload.get("tool_input") or {}
     command = str(tin.get("command", "") or "")
+    note_identity = _note_identity(tool, tin, command)
 
     nudge_every = _int_env("NOTES_GATE_NUDGE_EVERY", 12)
     block_at = _int_env("NOTES_GATE_BLOCK_AT", 20)
@@ -201,6 +266,7 @@ def _decide():
     countf = os.path.join(state_dir, sid + ".count")
     sizef = os.path.join(state_dir, sid + ".size")
     dbidf = os.path.join(state_dir, sid + ".dbid")
+    pendingf = os.path.join(state_dir, sid + ".note-pending")
 
     # --- Is THIS call a note-event (the thing that clears the gate)? ---------
     grew, cur_size = _mirror_grew(mirror, sizef)
@@ -217,14 +283,13 @@ def _decide():
         except re.error:
             pass  # a bad custom regex must not wedge the gate
 
-    # The DB watermark is authoritative. A tool-shaped call or mirror edit does not
-    # clear the gate unless a SQLite row really committed.
+    # The DB watermark is authoritative.  More importantly, the cursor used to
+    # prove an append is scoped to THIS session's note-tool invocation.  A global
+    # "MAX(id) advanced since any prior call" check lets agent B's append clear
+    # agent A's debt.  PreToolUse snapshots the cursor only for a note attempt;
+    # PostToolUse may clear only that same session's pending attempt.
     dbid = _max_note_id(_db_path())
-    seen_dbid = _read_int(dbidf, default=-1)
-    if seen_dbid < 0:
-        _write_int(dbidf, dbid)
-        seen_dbid = dbid
-    db_advanced = dbid > seen_dbid
+    pending_dbid = _read_int(pendingf, default=-1)
 
     n = _read_int(countf, default=0)
 
@@ -237,6 +302,8 @@ def _decide():
                 "hook." % cli_hint)
 
     if event == "PreToolUse":
+        if is_note_attempt:
+            _write_int(pendingf, dbid)
         if n >= block_at and not is_note_attempt and tool not in ALWAYS_ALLOW:
             msg = ("NOTES GATE — BLOCKED: %d tool calls since your last note (this "
                    "session). Record what you have DONE / TRIED / LEARNED / RULED OUT "
@@ -248,12 +315,29 @@ def _decide():
         return 0
 
     if event == "PostToolUse":
-        if db_advanced:
+        # Only a durable append bracketed by this session's own Pre/Post note
+        # event clears its counter. Incidental rows from concurrent sessions are
+        # deliberately ignored.
+        matched_id = (_matching_note_id(_db_path(), pending_dbid, note_identity)
+                      if is_note_attempt and pending_dbid >= 0 else 0)
+        if (is_note_attempt and pending_dbid >= 0 and matched_id > 0
+                and _tool_succeeded(payload)):
             _write_int(countf, 0)
-            _write_int(dbidf, dbid)
+            _write_int(dbidf, matched_id)
+            try:
+                os.remove(pendingf)
+            except OSError:
+                pass
             if mirror and cur_size is not None:
                 _write_int(sizef, cur_size)
             return 0
+        if is_note_attempt:
+            # A failed/spoofed append must not leave a cursor that a later,
+            # unrelated call could satisfy.
+            try:
+                os.remove(pendingf)
+            except OSError:
+                pass
         n += 1
         _write_int(countf, n)
         if n >= block_at:

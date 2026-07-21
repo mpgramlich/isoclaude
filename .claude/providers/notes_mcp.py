@@ -60,7 +60,11 @@ def _find_repo_root() -> str | None:
     repository root.  A git worktree's ``.git`` may be either a directory or a
     file, so existence is the only test that is safe here.
     """
-    starts = [os.getcwd(), os.path.dirname(os.path.abspath(__file__))]
+    # Prefer the provider's installed location.  MCP clients normally launch it
+    # from the project root, but the CLI is also used from orchestration shells
+    # whose cwd may be a different fleet repository.  Looking at cwd first can
+    # silently put a worktree's notes in that unrelated repository.
+    starts = [os.path.dirname(os.path.abspath(__file__)), os.getcwd()]
     seen = set()
     for start in starts:
         cur = os.path.abspath(start)
